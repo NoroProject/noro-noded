@@ -207,6 +207,84 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .map_err(fs_error)
         }
 
+        NodeOp::SleepPlaceholder {
+            server,
+            port,
+            listing,
+            enable,
+        } => {
+            if !enable {
+                // `remove` отдаёт держатель, и его `Drop` отпускает порт:
+                // контейнеру он сейчас понадобится.
+                daemon.placeholders.remove(&server);
+                return Ok(Value::Null);
+            }
+
+            // Повторное включение не поднимает второй слушатель на том же
+            // порту: мастер может прислать его снова после переподключения.
+            if daemon.placeholders.contains_key(&server) {
+                return Ok(Value::Null);
+            }
+
+            let engine = daemon.engine.clone();
+            let registry = daemon.registry.clone();
+            let events = daemon.events.clone();
+            let placeholders = daemon.placeholders.clone();
+
+            let held = crate::server::waker::hold(
+                server,
+                port,
+                *listing,
+                std::sync::Arc::new(move |server: Uuid| {
+                    // Порт отпускается первым: контейнер не поднимется, пока
+                    // слушатель держит его за собой.
+                    placeholders.remove(&server);
+                    let engine = engine.clone();
+                    let registry = registry.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        registry.get_or_create(server).starting_on_purpose();
+                        if let Err(e) = engine.start(server).await {
+                            tracing::warn!(%server, error = %format!("{e:#}"), "разбудить не удалось");
+                            return;
+                        }
+                        let _ = supervisor::attach(engine, registry, events, server).await;
+                    });
+                }),
+            )
+            .await
+            .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
+
+            daemon.placeholders.insert(server, held);
+            Ok(Value::Null)
+        }
+
+        NodeOp::ServerPing { port, .. } => {
+            // Loopback: the container publishes its port on the node, and the
+            // game port is often closed to everyone but the machine itself.
+            let pong = crate::server::ping::ping("127.0.0.1", port).await;
+            Ok(serde_json::to_value(pong).unwrap_or(Value::Null))
+        }
+
+        NodeOp::ServerCloneFiles {
+            server,
+            from,
+            include_worlds,
+        } => {
+            let to = daemon.cfg.server_dir(server);
+            let source = daemon.cfg.server_dir(from);
+            // Blocking copy on the blocking pool: a world is gigabytes, and
+            // doing that on the async runtime stalls every other server's
+            // console on this node.
+            tokio::task::spawn_blocking(move || {
+                crate::server::clone::run(&source, &to, include_worlds)
+            })
+            .await
+            .map_err(|e| OpError::new("upstream_failed", format!("{e}")))?
+            .map(|r| serde_json::json!({ "files": r.files, "bytes": r.bytes }))
+            .map_err(|e| OpError::new("upstream_failed", format!("{e:#}")))
+        }
+
         NodeOp::BuildSync {
             server,
             files,

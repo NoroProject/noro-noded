@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "noded"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2833,6 +2833,7 @@ dependencies = [
 [[package]]
 name = "schema"
 version = "3.0.0"
+source = "git+https://github.com/NoroProject/noro-shared.git?branch=master#a99cba978d501b29cf508e067d9c7b1107411b21"
 dependencies = [
  "chrono",
  "once_cell",

@@ -21,6 +21,7 @@ use schema::noded::NodeEvent;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::docker::Engine;
@@ -55,6 +56,8 @@ pub struct Daemon {
     pub http_tickets: http::Tickets,
     /// Сколько места занимают серверы и сколько им можно.
     pub quota: fs::quota::Quota,
+    /// Порты, которые демон держит за спящими серверами.
+    pub placeholders: Arc<dashmap::DashMap<Uuid, server::waker::Placeholder>>,
 }
 
 impl Daemon {
@@ -98,6 +101,7 @@ async fn main() -> Result<()> {
         sftp_fingerprint: Arc::new(parking_lot::Mutex::new(None)),
         http_tickets: http::Tickets::default(),
         quota: fs::quota::Quota::default(),
+        placeholders: Arc::new(dashmap::DashMap::new()),
     };
 
     // Переподключиться к тому, что уже работает, до первого кадра мастеру:

@@ -1,0 +1,171 @@
+# Release of the node daemon. The master triggers this through
+# `workflow_dispatch` and then waits for a release under the same tag: it picks
+# up the assets, signs the descriptor and serves them to nodes itself.
+#
+# The tag in `run-name` is the only way to match a run to a job —
+# `workflow_dispatch` does not return a run id.
+name: Release noded
+
+run-name: noded ${{ inputs.tag || github.ref_name }} [${{ inputs.job_id || 'push' }}]
+
+on:
+  # Fallback path: without a token on the master, a tag push still builds.
+  push:
+    tags:
+      - 'v*'
+      - 'noded-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. noded-v3.1.0
+        required: true
+        type: string
+      job_id:
+        description: Master job id, used to match up the run
+        required: false
+        default: manual
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # On a tag push inputs are empty and the tag comes from the ref.
+  TAG: ${{ inputs.tag || github.ref_name }}
+  IMAGE: noroproject/noded
+
+jobs:
+  guard:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      # The master hands out the version it read from the tag, while the daemon
+      # reports its own CARGO_PKG_VERSION in `hello`. If they drift, the panel
+      # shows one version and the machine runs another.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          MANIFEST=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "v$MANIFEST" ] && [ "$TAG" != "noded-v$MANIFEST" ]; then
+            echo "::error::tag $TAG does not match the Cargo.toml version ($MANIFEST). Expected v$MANIFEST or noded-v$MANIFEST"
+            exit 1
+          fi
+          echo "tag and manifest agree: $TAG"
+
+  build:
+    name: noded ${{ matrix.target }}
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # The action above adds the target to stable, but rust-toolchain.toml
+      # pins a different version and rustup switches to it on the first cargo
+      # call — where the target isn't installed and the build dies with
+      # `can't find crate for core`.
+      - name: Add the target to the pinned toolchain
+        run: |
+          set -euo pipefail
+          CHANNEL=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$CHANNEL" --profile minimal
+          rustup target add --toolchain "$CHANNEL" ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: noded-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      # The name carries the target: the master picks the asset by the node's
+      # architecture, which it learns from `hello`.
+      - name: Name the asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/noro-noded" "dist/noro-noded-${{ matrix.target }}"
+          sha256sum "dist/noro-noded-${{ matrix.target }}" > "dist/noro-noded-${{ matrix.target }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noded-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The master waits for a release under this exact tag and reads the
+      # noro-noded-* assets from it.
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          tag_name: ${{ env.TAG }}
+
+  image:
+    name: Docker image
+    needs: build
+    runs-on: ubuntu-latest
+    # Without credentials the binaries are still released: the container is one
+    # of two ways to run the daemon, not the only one.
+    if: ${{ github.event_name == 'push' || inputs.job_id != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Built from source inside the image rather than from the artifacts
+      # above: the release binaries are gnu-linked, and the runtime image is
+      # Debian for exactly that reason. One build path, not two.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

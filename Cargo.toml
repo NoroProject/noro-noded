@@ -1,0 +1,67 @@
+[package]
+name = "noded"
+version = "3.0.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+authors = ["noro"]
+description = "Noro node daemon: runs Minecraft servers in Docker under the master's control"
+repository = "https://github.com/NoroProject/noro-noded"
+
+[[bin]]
+name = "noro-noded"
+path = "src/main.rs"
+
+[dependencies]
+# Протокол общий с мастером и живёт в noro-shared — здесь он берётся из git,
+# как и в лаунчере. Расхождение версий тут ломает канал, поэтому ветка одна и
+# та же для всех трёх сторон.
+schema = { git = "https://github.com/NoroProject/noro-shared.git", package = "schema", branch = "master" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart", "http2"] }
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Умолчания у bollard — это http + unix-сокет; `default-features = false`
+# отрезает `connect_with_unix`, и демон перестаёт видеть Docker вовсе.
+bollard = "0.21"
+russh = "0.63"
+russh-sftp = "2"
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
+rand = "0.8"
+# `ssh-key` внутри russh собран против rand_core 0.10, и генерация хост-ключа
+# требует `CryptoRng` именно оттуда. Старый `rand` остаётся для всего прочего.
+rand10 = { package = "rand", version = "0.10" }
+
+tar = "0.4"
+flate2 = "1"
+zip = "2"
+walkdir = "2"
+dashmap = "6"
+parking_lot = "0.12"
+bytes = "1"
+
+[profile.release]
+strip = true
+lto = "thin"

@@ -1,0 +1,46 @@
+# Checks on every PR and every push to master.
+#
+# Runs on GitHub's runners, not the self-hosted one: that machine also serves
+# production, and a daemon build is not worth its quota.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-noded
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      # Warnings are errors here for the same reason as everywhere else in the
+      # project: the toolchain is pinned in rust-toolchain.toml, so a new Rust
+      # release cannot turn the build red on its own.
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test

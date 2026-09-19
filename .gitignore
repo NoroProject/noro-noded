@@ -1,0 +1,3 @@
+/target
+# Локальный оверрайд протокола на соседнюю копию noro-shared.
+/.cargo/config.toml

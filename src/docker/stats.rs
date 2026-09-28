@@ -35,7 +35,7 @@ impl Engine {
         root: &std::path::Path,
     ) -> Result<ServerStats> {
         let mut stats = self.stats_once(server).await?;
-        stats.disk_mb = quota.usage(server, root).used_mb();
+        stats.disk_mb = quota.usage(server, root).await.used_mb();
         Ok(stats)
     }
 }

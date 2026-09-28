@@ -51,6 +51,34 @@ fn a_plain_jar_is_launched_with_dash_jar() {
     );
 }
 
+/// Без `-javaagent` сервер спрашивает аккаунты у Mojang, а игроки заходят
+/// лаунчером: `online-mode=true` тогда не пускает вообще никого.
+#[test]
+fn authlib_injector_lands_before_the_jar() {
+    let mut s = spec();
+    s.authlib_url = Some("https://noro.example/api/yggdrasil".into());
+    let cmd = command_line(&s);
+
+    let agent = cmd
+        .iter()
+        .position(|a| a.starts_with("-javaagent:"))
+        .expect("аргумент есть");
+    let jar = cmd.iter().position(|a| a == "-jar").expect("jar есть");
+    assert!(agent < jar, "javaagent обязан стоять до jar: {cmd:?}");
+    assert_eq!(
+        cmd[agent],
+        "-javaagent:/home/container/.noro/authlib-injector.jar=https://noro.example/api/yggdrasil"
+    );
+}
+
+/// Ванильная авторизация остаётся ванильной: сервер без привязки к нашим
+/// аккаунтам не должен получать чужой агент в строку запуска.
+#[test]
+fn without_authlib_the_command_stays_clean() {
+    let cmd = command_line(&spec());
+    assert!(!cmd.iter().any(|a| a.starts_with("-javaagent:")));
+}
+
 /// NeoForge запускается файлом аргументов, а не jar'ом. Java-враппер
 /// пробрасывает его как есть, и ломать это незачем.
 #[test]
@@ -68,6 +96,32 @@ fn a_neoforge_args_file_is_passed_through_untouched() {
         "аргументы сервера идут после файла"
     );
     assert!(cmd.contains(&s.jar));
+}
+
+/// У Forge и NeoForge в корне jar'а нет вовсе: запуск идёт файлом аргументов,
+/// который разворачивается на месте. Поэтому `-javaagent` обязан стоять до
+/// него — после разворачивания там уже главный класс, и агент уехал бы ему в
+/// аргументы вместо JVM.
+#[test]
+fn authlib_precedes_a_neoforge_args_file_too() {
+    let mut s = spec();
+    s.jar = "@libraries/net/neoforged/neoforge/21.1.77/unix_args.txt".into();
+    s.authlib_url = Some("https://noro.example/api/yggdrasil".into());
+    let cmd = command_line(&s);
+
+    let agent = cmd
+        .iter()
+        .position(|a| a.starts_with("-javaagent:"))
+        .expect("аргумент есть");
+    let args_file = cmd.iter().position(|a| a == &s.jar).expect("файл есть");
+    assert!(
+        agent < args_file,
+        "javaagent обязан стоять до @-файла: {cmd:?}"
+    );
+    assert!(
+        !cmd.contains(&"-jar".to_string()),
+        "-jar тут лишний: {cmd:?}"
+    );
 }
 
 #[test]

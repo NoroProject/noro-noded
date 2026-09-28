@@ -67,13 +67,24 @@ impl Engine {
     }
 }
 
-/// Команда запуска: java + аргументы JVM + jar + аргументы сервера.
+/// Команда запуска: java + аргументы JVM + authlib + jar + аргументы сервера.
 ///
 /// `@libraries/…/unix_args.txt` для NeoForge передаётся как есть — ровно так же
 /// это делает Java-враппер, и ломать совместимость со сборками незачем.
+///
+/// `-javaagent` идёт после пользовательских аргументов и до jar — в том же
+/// месте, что у враппера. Без него сервер с `online-mode=true` спрашивает
+/// аккаунты у Mojang и не пускает на себя вообще никого: игроки заходят
+/// лаунчером, а его учётки живут в нашем Yggdrasil.
 fn command_line(spec: &ServerSpec) -> Vec<String> {
     let mut cmd = vec!["java".to_string()];
     cmd.extend(spec.jvm_args.clone());
+    if let Some(url) = &spec.authlib_url {
+        cmd.push(format!(
+            "-javaagent:{}={url}",
+            crate::server::layout::Layout::container_authlib_jar()
+        ));
+    }
     if spec.jar.starts_with('@') {
         cmd.push(spec.jar.clone());
     } else {

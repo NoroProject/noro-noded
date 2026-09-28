@@ -5,6 +5,11 @@
 //! домена и сертификата. Переподключение — с нарастающей паузой и джиттером:
 //! десяток нод, потерявших мастер одновременно, иначе вернутся к нему ровно в
 //! один и тот же момент.
+//!
+//! Операции выполняются **не в петле чтения**, а задачами, и отвечают через
+//! общий канал. Установка идёт минутами, бэкап большого мира — до четверти
+//! часа: делая их прямо здесь, нода на всё это время переставала слать консоль
+//! и состояния, то есть выглядела зависшей ровно тогда, когда на неё смотрят.
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -65,6 +70,10 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = tokio::time::Instant::now();
 
+    // Ответы задач возвращаются сюда: писать в сокет из нескольких задач
+    // нельзя, а отдавать им сам сокет — тем более.
+    let (replies_tx, mut replies) = mpsc::unbounded_channel::<String>();
+
     loop {
         tokio::select! {
             incoming = rx.next() => {
@@ -72,7 +81,7 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
                 match message? {
                     Message::Text(text) => {
                         last_seen = tokio::time::Instant::now();
-                        handle_frame(daemon, &mut tx, &text).await?;
+                        handle_frame(daemon, &replies_tx, &text);
                     }
                     Message::Ping(payload) => {
                         tx.send(Message::Pong(payload)).await?;
@@ -81,6 +90,10 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
                     Message::Close(_) => return Ok(()),
                     _ => {}
                 }
+            }
+
+            Some(frame) = replies.recv() => {
+                tx.send(Message::Text(frame)).await?;
             }
 
             Some(event) = events.recv() => {
@@ -103,53 +116,55 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
     }
 }
 
-type Sink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-
-async fn handle_frame(daemon: &Daemon, tx: &mut Sink, text: &str) -> Result<()> {
+/// Разобрать кадр мастера. Ответ уходит каналом, а не в сокет: писать в него
+/// имеет право только петля, иначе два кадра перемешаются на полуслове.
+fn handle_frame(daemon: &Daemon, replies: &mpsc::UnboundedSender<String>, text: &str) {
     let frame: ToNode = match serde_json::from_str(text) {
         Ok(f) => f,
         Err(e) => {
             // Незнакомый кадр — это мастер новее ноды. Рвать из-за этого связь
             // нельзя: остальные операции работают.
             tracing::warn!(error = %e, "кадр от мастера не разобран");
-            return Ok(());
+            return;
         }
     };
 
     match frame {
-        ToNode::Ping { seq } => {
-            let pong = FromNode::Pong { seq };
-            tx.send(Message::Text(serde_json::to_string(&pong)?))
-                .await?;
-        }
-        ToNode::Cancel { id } => {
-            tracing::info!(id, "отмена запроса");
-        }
+        ToNode::Ping { seq } => send(replies, &FromNode::Pong { seq }),
+        ToNode::Cancel { id } => tracing::info!(id, "отмена запроса"),
         ToNode::Request { id, op } => {
             let daemon = daemon.clone();
-            let reply = dispatch::handle(&daemon, op).await;
-            let frame = match reply {
-                Ok(data) => FromNode::Reply {
-                    id,
-                    ok: true,
-                    data,
-                    error: None,
-                },
-                Err(error) => FromNode::Reply {
-                    id,
-                    ok: false,
-                    data: serde_json::Value::Null,
-                    error: Some(error),
-                },
-            };
-            tx.send(Message::Text(serde_json::to_string(&frame)?))
-                .await?;
+            let replies = replies.clone();
+            tokio::spawn(async move {
+                let frame = match dispatch::handle(&daemon, op).await {
+                    Ok(data) => FromNode::Reply {
+                        id,
+                        ok: true,
+                        data,
+                        error: None,
+                    },
+                    Err(error) => FromNode::Reply {
+                        id,
+                        ok: false,
+                        data: serde_json::Value::Null,
+                        error: Some(error),
+                    },
+                };
+                send(&replies, &frame);
+            });
         }
     }
-    Ok(())
+}
+
+/// Отказ отправки значит «соединение уже закрыто»: задача переживает разрыв,
+/// а мастер после переподключения спросит заново.
+fn send(replies: &mpsc::UnboundedSender<String>, frame: &FromNode) {
+    match serde_json::to_string(frame) {
+        Ok(text) => {
+            let _ = replies.send(text);
+        }
+        Err(e) => tracing::warn!(error = %e, "ответ не сериализован"),
+    }
 }
 
 async fn hello(daemon: &Daemon) -> Result<FromNode> {

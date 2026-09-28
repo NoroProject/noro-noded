@@ -31,6 +31,13 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .prepare()
                 .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
 
+            // Чем запускать, решает диск, а не карточка сервера: имя мог
+            // сменить установщик. Найденное уезжает в ответе — мастеру надо
+            // запомнить его, иначе следующая пересборка начнёт с того же.
+            let mut spec = *spec;
+            spec.jar = install::resolve_entry_point(&layout.root, &spec.jar);
+            let spec = Box::new(spec);
+
             // Лимит кладётся на диск рядом с сервером: демон перезапускается, а
             // квота должна знать потолок и после этого — в памяти он бы пропал.
             let limits = fs::quota::Limits {
@@ -39,11 +46,30 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             if let Err(e) = fs::quota::write_limits(&layout.root, &limits) {
                 tracing::warn!(%server, error = %e, "лимит диска не записан");
             }
-            daemon.quota.measure(server, &layout.root);
+            daemon.quota.measure(server, &layout.root).await;
+
+            // Строка запуска ссылается на authlib-injector, а пересоздание
+            // идёт мимо установки: без этой докачки контейнер, которому
+            // аккаунты лаунчера включили после установки, не стартовал бы
+            // вовсе.
+            install::ensure_authlib(&daemon.master, &layout, &spec)
+                .await
+                .map_err(|e| OpError::new("upstream_failed", format!("{e:#}")))?;
+
             // Пересоздание вместо правки: докер не умеет менять лимиты живого
             // контейнера, а притворяться, что умеет, — значит разойтись с тем,
             // что показывает панель.
+            //
+            // Живой сервер сначала гасится по-человечески. `remove` идёт с
+            // `force`, то есть SIGKILL: правка лимитов не должна стоить
+            // игрокам несохранённого мира. Что работало — поднимаем обратно.
+            let running = daemon.engine.was_running(server).await;
+            let handle = daemon.registry.get_or_create(server);
             if daemon.engine.exists(server).await {
+                if running {
+                    handle.stopping_on_purpose();
+                    daemon.engine.stop(server).await.ok();
+                }
                 daemon.engine.remove(server).await.ok();
             }
             daemon
@@ -54,8 +80,18 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                     host_dir: &daemon.cfg.host_server_dir(server),
                 })
                 .await
-                .map(|_| Value::Null)
-                .map_err(|e| OpError::new("docker_failed", e.to_string()))
+                .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
+
+            if running {
+                handle.starting_on_purpose();
+                daemon
+                    .engine
+                    .start(server)
+                    .await
+                    .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
+                attach(daemon, server).await?;
+            }
+            Ok(json!({ "jar": spec.jar }))
         }
 
         NodeOp::ServerDelete { server, keep_files } => {
@@ -138,6 +174,7 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             daemon
                 .quota
                 .check(server, &root, content.len() as u64)
+                .await
                 .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
 
             fs::io::write_text(&root, &path, &content)
@@ -155,7 +192,7 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             }
             // Пересчитываем сразу: иначе освобождённое место «появится» только
             // через минуту, и уборка ради заливки выглядела бы бесполезной.
-            daemon.quota.measure(server, &root);
+            daemon.quota.measure(server, &root).await;
             Ok(Value::Null)
         }
 
@@ -185,13 +222,17 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .map_err(|e| OpError::new("upstream_failed", e.to_string()))
         }
 
+        // Упаковка и распаковка идут в блокирующем пуле: архив каталога с
+        // модами — это минуты, и на рабочем потоке рантайма они стоят консоли
+        // всем серверам ноды.
         NodeOp::FsArchive {
             server,
             paths,
             dest,
         } => {
             let root = daemon.cfg.server_dir(server);
-            fs::archive::pack(&root, &paths, &dest)
+            blocking(move || fs::archive::pack(&root, &paths, &dest))
+                .await
                 .map(|count| json!({ "count": count }))
                 .map_err(fs_error)
         }
@@ -202,7 +243,8 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             dest_dir,
         } => {
             let root = daemon.cfg.server_dir(server);
-            fs::archive::unpack(&root, &path, &dest_dir)
+            blocking(move || fs::archive::unpack(&root, &path, &dest_dir))
+                .await
                 .map(|count| json!({ "count": count }))
                 .map_err(fs_error)
         }
@@ -230,19 +272,43 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             let registry = daemon.registry.clone();
             let events = daemon.events.clone();
             let placeholders = daemon.placeholders.clone();
+            let gate = daemon.wake_gate.clone();
 
             let held = crate::server::waker::hold(
                 server,
                 port,
                 *listing,
                 std::sync::Arc::new(move |server: Uuid| {
-                    // Порт отпускается первым: контейнер не поднимется, пока
-                    // слушатель держит его за собой.
-                    placeholders.remove(&server);
+                    // Стучать в порт может кто угодно, поэтому здесь два рубежа.
+                    // Первый — частота, и он же защёлка: проверка памяти ниже
+                    // асинхронная, плашка на порту всё ещё отвечает, и без
+                    // отметки времени пачка стуков дала бы пачку запусков.
+                    if !gate.allow(server) {
+                        tracing::debug!(%server, "побудка отклонена: слишком часто");
+                        return;
+                    }
                     let engine = engine.clone();
                     let registry = registry.clone();
                     let events = events.clone();
+                    let placeholders = placeholders.clone();
                     tokio::spawn(async move {
+                        // Второй рубеж — память. Переподписка ноды рассчитана на
+                        // то, что не всё работает разом, а поднять всё разом
+                        // может любой, кто обойдёт порты спящих серверов.
+                        if let Some(need) = engine.memory_limit_mb(server).await {
+                            let free = crate::metrics::available_memory_mb();
+                            if free < need {
+                                tracing::warn!(
+                                    %server, need, free,
+                                    "побудка отклонена: на ноде нет столько памяти"
+                                );
+                                return;
+                            }
+                        }
+                        // Порт отпускается перед запуском, но только когда
+                        // запуск действительно будет: отпустить и отказать —
+                        // значит убрать и плашку, и сервер из списка.
+                        placeholders.remove(&server);
                         registry.get_or_create(server).starting_on_purpose();
                         if let Err(e) = engine.start(server).await {
                             tracing::warn!(%server, error = %format!("{e:#}"), "разбудить не удалось");
@@ -502,6 +568,17 @@ fn spawn_install_log(
                 .await;
         }
     });
+}
+
+/// Выполнить блокирующую работу вне рабочих потоков рантайма.
+async fn blocking<T, F>(work: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("задача не выполнена: {e}")))
 }
 
 fn docker_error(e: anyhow::Error) -> OpError {

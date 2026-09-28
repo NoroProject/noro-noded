@@ -9,4 +9,5 @@ pub mod props;
 pub mod registry;
 pub mod supervisor;
 pub mod sync;
+pub mod wake_gate;
 pub mod waker;

@@ -28,6 +28,16 @@ pub fn machine() -> Machine {
     }
 }
 
+/// Сколько памяти на машине свободно сейчас.
+///
+/// Отдельно от `sample`: побудке нужно одно число, а диски и загрузка CPU там
+/// стоят дороже самого ответа, и спрашивают их раз в полминуты, а не на стук.
+pub fn available_memory_mb() -> i64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    (sys.available_memory() / 1024 / 1024) as i64
+}
+
 /// Текущая загрузка ноды.
 pub fn sample(running: u32) -> NodeStats {
     let mut sys = System::new();

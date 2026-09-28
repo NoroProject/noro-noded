@@ -40,7 +40,12 @@ pub async fn create(
 ) -> Result<BackupResult> {
     let quiesced = quiesce(registry, root).await;
 
-    let result = pack(root, dest, ignore);
+    // Упаковка мира — это gzip поверх гигабайтов: на рабочем потоке рантайма
+    // она останавливает консоли всех серверов ноды на всё время бэкапа.
+    let (src, dst, ignore) = (root.to_path_buf(), dest.to_path_buf(), ignore.to_vec());
+    let result = tokio::task::spawn_blocking(move || pack(&src, &dst, &ignore))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("упаковка не выполнена: {e}")));
 
     if quiesced {
         // Отпускаем сервер даже если упаковка провалилась: иначе он останется

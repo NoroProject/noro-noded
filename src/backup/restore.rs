@@ -36,6 +36,15 @@ pub async fn restore(
         bail!("архива нет на этой ноде");
     }
 
+    // Распаковка тоже блокирующая и тоже на гигабайты — на рабочем потоке
+    // рантайма она заморозила бы всю ноду, а не только этот сервер.
+    let (root, archive) = (root.to_path_buf(), archive.to_path_buf());
+    tokio::task::spawn_blocking(move || unpack_into(&root, &archive))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("распаковка не выполнена: {e}")))
+}
+
+fn unpack_into(root: &Path, archive: &Path) -> Result<()> {
     let file = std::fs::File::open(archive)?;
     let mut tar = tar::Archive::new(GzDecoder::new(file));
 

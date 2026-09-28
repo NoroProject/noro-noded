@@ -98,6 +98,28 @@ impl Engine {
         Ok((power, exit_code, uptime))
     }
 
+    /// Сколько памяти контейнеру разрешено занять.
+    ///
+    /// `None` — контейнера ещё нет либо лимит не задан, и тогда о допуске судить
+    /// не по чему: отказывать на этом основании было бы отказом наугад.
+    pub async fn memory_limit_mb(&self, server: uuid::Uuid) -> Option<i64> {
+        let info = self
+            .docker
+            .inspect_container(&Engine::container_name(server), None)
+            .await
+            .ok()?;
+        let bytes = info.host_config?.memory?;
+        (bytes > 0).then_some(bytes / 1024 / 1024)
+    }
+
+    /// Работает ли контейнер прямо сейчас.
+    ///
+    /// Отдельно от `state`: пересборке нужен один бит, а не разбор причины
+    /// падения, и контейнера может не быть вовсе.
+    pub async fn was_running(&self, server: uuid::Uuid) -> bool {
+        matches!(self.state(server).await, Ok((power, ..)) if power.is_up())
+    }
+
     pub async fn exists(&self, server: uuid::Uuid) -> bool {
         self.docker
             .inspect_container(&Engine::container_name(server), None)

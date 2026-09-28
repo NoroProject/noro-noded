@@ -27,6 +27,31 @@ use crate::server::props;
 /// раздаёт его лаунчеру, и знает, какой считает своим.
 const AUTHLIB_PATH: &str = "/api/agent/authlib-injector.jar";
 
+/// Докачать authlib-injector, если его ещё нет. `true` — качали сейчас.
+///
+/// Отдельно от установки, потому что контейнер пересоздаётся и мимо неё:
+/// аккаунты лаунчера включают и на давно стоящем сервере, а `-javaagent` на
+/// несуществующий файл java не прощает — процесс не стартует вообще.
+pub async fn ensure_authlib(
+    master: &MasterClient,
+    layout: &Layout,
+    spec: &schema::noded::ServerSpec,
+) -> Result<bool> {
+    if spec.authlib_url.is_none() {
+        return Ok(false);
+    }
+    let jar = layout.authlib_jar();
+    if jar.is_file() {
+        return Ok(false);
+    }
+    let url = format!("{}{AUTHLIB_PATH}", master.base());
+    master
+        .download(&url, &jar, None, None)
+        .await
+        .context("не скачать authlib-injector")?;
+    Ok(true)
+}
+
 pub struct InstallCtx<'a> {
     pub engine: &'a Engine,
     pub master: &'a MasterClient,
@@ -83,12 +108,7 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
     props::apply(&root.join("server.properties"), &spec.properties)?;
 
     // 5. authlib-injector — внутрь маунта, иначе контейнер его не увидит.
-    if spec.spec.authlib_url.is_some() {
-        let url = format!("{}{AUTHLIB_PATH}", ctx.master.base());
-        ctx.master
-            .download(&url, &ctx.layout.authlib_jar(), None, None)
-            .await
-            .context("не скачать authlib-injector")?;
+    if ensure_authlib(ctx.master, ctx.layout, &spec.spec).await? {
         let _ = ctx.log.send("authlib-injector установлен".into()).await;
     }
 
@@ -214,6 +234,32 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
     find_installed_jar(&ctx.layout.root).context("установщик отработал, но запускать нечего")
 }
 
+/// Чем сервер запускается на самом деле.
+///
+/// Мастер присылает то, что записано в карточке, а правда лежит на диске: имя
+/// мог сменить установщик, а карточка — остаться с `server.jar`. Пересобрать
+/// контейнер под несуществующий файл значит сломать работающий сервер правкой
+/// лимита памяти.
+///
+/// Если на диске не нашлось ничего похожего, оставляем присланное: отказ при
+/// старте с внятной строкой в логе честнее, чем подставленный наугад файл.
+pub fn resolve_entry_point(root: &Path, wanted: &str) -> String {
+    let exists = match wanted.strip_prefix('@') {
+        Some(rel) => root.join(rel).is_file(),
+        None => !wanted.is_empty() && root.join(wanted).is_file(),
+    };
+    if exists {
+        return wanted.to_string();
+    }
+    match find_installed_jar(root) {
+        Some(found) => {
+            tracing::info!(wanted, found, "точка входа найдена на диске");
+            found
+        }
+        None => wanted.to_string(),
+    }
+}
+
 /// Что запускать после установщика.
 ///
 /// NeoForge кладёт файл аргументов, Forge — свой jar, и угадывать имя по версии
@@ -231,15 +277,34 @@ fn find_installed_jar(root: &Path) -> Option<String> {
         return Some(format!("@{}", rel.display()));
     }
 
-    std::fs::read_dir(root)
+    // В корне ищем то, чем сервер вообще может быть: имена у ядер разные —
+    // `paper-1.21.1-133.jar`, `fabric-server-launch.jar`, `forge-1.16.5-….jar`,
+    // `server.jar`. Установщик и клиентский jar исключаются явно.
+    let mut candidates: Vec<String> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|name| {
-            name.ends_with(".jar")
-                && (name.contains("forge") || name.contains("server"))
-                && !name.contains("installer")
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.ends_with(".jar") && !lower.contains("installer") && !lower.contains("client")
         })
+        .collect();
+
+    // Порядок разбора важен: при нескольких кандидатах выигрывает тот, чьё имя
+    // прямо называет себя сервером, а не первый попавшийся в каталоге.
+    candidates.sort();
+    let rank = |name: &str| {
+        let lower = name.to_lowercase();
+        match () {
+            _ if lower == "server.jar" => 0,
+            _ if lower.contains("server") => 1,
+            _ if lower.contains("forge") => 2,
+            _ if lower.contains("paper") || lower.contains("purpur") => 3,
+            _ => 4,
+        }
+    };
+    candidates.into_iter().min_by_key(|name| rank(name))
 }
 
 fn core_file_name(url: &str) -> String {
@@ -253,6 +318,94 @@ fn core_file_name(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Dir(std::path::PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("noded-entry-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn file(&self, rel: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// То, что на диске есть, не перепроверяется: карточка права.
+    #[test]
+    fn an_existing_entry_point_is_kept() {
+        let d = Dir::new();
+        d.file("paper-1.21.1-133.jar");
+        assert_eq!(
+            resolve_entry_point(&d.0, "paper-1.21.1-133.jar"),
+            "paper-1.21.1-133.jar"
+        );
+    }
+
+    /// Главная проверка файла. У сервера, поставленного до того, как мастер
+    /// научился запоминать точку входа, в карточке стоит `server.jar` — и
+    /// пересборка контейнера по ней ломала работающий сервер.
+    #[test]
+    fn a_stale_card_is_corrected_from_the_disk() {
+        let d = Dir::new();
+        d.file("paper-1.21.1-133.jar");
+        assert_eq!(
+            resolve_entry_point(&d.0, "server.jar"),
+            "paper-1.21.1-133.jar"
+        );
+    }
+
+    /// У NeoForge в корне вообще нет jar: запускается он файлом аргументов,
+    /// который написал установщик.
+    #[test]
+    fn a_neoforge_args_file_is_found_instead_of_a_jar() {
+        let d = Dir::new();
+        d.file("libraries/net/neoforged/neoforge/21.1.77/unix_args.txt");
+        assert_eq!(
+            resolve_entry_point(&d.0, "server.jar"),
+            "@libraries/net/neoforged/neoforge/21.1.77/unix_args.txt"
+        );
+    }
+
+    /// Файл аргументов на месте — его и оставляем, не уходя искать заново.
+    #[test]
+    fn an_existing_args_file_is_kept() {
+        let d = Dir::new();
+        d.file("libraries/net/neoforged/neoforge/21.1.77/unix_args.txt");
+        let wanted = "@libraries/net/neoforged/neoforge/21.1.77/unix_args.txt";
+        assert_eq!(resolve_entry_point(&d.0, wanted), wanted);
+    }
+
+    /// Установщик остаётся лежать в корне рядом с результатом. Запустить его
+    /// вместо сервера — это установка по кругу на каждый старт.
+    #[test]
+    fn the_installer_is_never_the_entry_point() {
+        let d = Dir::new();
+        d.file("forge-1.16.5-36.2.39-installer.jar");
+        d.file("forge-1.16.5-36.2.39.jar");
+        assert_eq!(
+            resolve_entry_point(&d.0, "server.jar"),
+            "forge-1.16.5-36.2.39.jar"
+        );
+    }
+
+    /// Ничего похожего на диске нет — присланное остаётся как есть: отказ при
+    /// старте с внятной строкой честнее подставленного наугад файла.
+    #[test]
+    fn nothing_on_disk_leaves_the_card_alone() {
+        let d = Dir::new();
+        assert_eq!(resolve_entry_point(&d.0, "server.jar"), "server.jar");
+    }
 
     #[test]
     fn the_core_name_comes_from_the_url() {

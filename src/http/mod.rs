@@ -108,7 +108,11 @@ async fn upload(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let root = daemon.cfg.server_dir(ticket.server);
-    if let Err(e) = daemon.quota.check(ticket.server, &root, declared) {
+    // Замер снимается один раз на всю заливку. Прежде предел сверялся на
+    // каждый пришедший кусок, и как только клиент врал про длину, каждый из
+    // них норовил заново обойти каталог сервера целиком.
+    let usage = daemon.quota.usage(ticket.server, &root).await;
+    if let Err(e) = usage.fits(declared) {
         return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
     }
 
@@ -143,9 +147,9 @@ async fn upload(
         written += chunk.len() as u64;
 
         // Заголовку верить нельзя: длину можно не прислать вовсе или соврать,
-        // поэтому предел проверяется и по ходу.
+        // поэтому предел проверяется и по ходу — но по уже снятому замеру.
         if written > declared {
-            if let Err(e) = daemon.quota.check(ticket.server, &root, written) {
+            if let Err(e) = usage.fits(written) {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
             }

@@ -29,7 +29,9 @@ use crate::link::master::MasterClient;
 use crate::server::registry::Registry;
 
 #[derive(Parser)]
-#[command(name = "noro-noded", about = "Демон ноды Noro")]
+// `version` — не украшение: скрипт обновления сверяет по нему установленное
+// с тем, что раскатано на мастере, и без него ему пришлось бы качать всегда.
+#[command(name = "noro-noded", version, about = "Демон ноды Noro")]
 struct Cli {
     /// Путь к конфигу.
     #[arg(

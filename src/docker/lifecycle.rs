@@ -29,9 +29,15 @@ impl Engine {
         let options = StopContainerOptionsBuilder::default()
             .t(STOP_TIMEOUT_SECS)
             .build();
-        self.docker
+        if let Err(e) = self
+            .docker
             .stop_container(&Engine::container_name(server), Some(options))
-            .await?;
+            .await
+        {
+            if !self.already_down(server).await {
+                return Err(e.into());
+            }
+        }
         Ok(())
     }
 
@@ -39,10 +45,27 @@ impl Engine {
         let options = KillContainerOptionsBuilder::default()
             .signal("SIGKILL")
             .build();
-        self.docker
+        if let Err(e) = self
+            .docker
             .kill_container(&Engine::container_name(server), Some(options))
-            .await?;
+            .await
+        {
+            if !self.already_down(server).await {
+                return Err(e.into());
+            }
+        }
         Ok(())
+    }
+
+    /// Контейнер существует, но не работает.
+    ///
+    /// Упавший сервер остаётся контейнером в состоянии `exited`, и докер на
+    /// «останови» отвечает отказом: `kill` — «container is not running», `stop`
+    /// — «not modified». Показывать это человеку незачем: он просил, чтобы
+    /// сервер не работал, и сервер не работает. Несуществующий контейнер под
+    /// это не подходит — там отказ по делу, и его мы отдаём как есть.
+    async fn already_down(&self, server: uuid::Uuid) -> bool {
+        matches!(self.state(server).await, Ok((power, ..)) if !power.is_up())
     }
 
     pub async fn remove(&self, server: uuid::Uuid) -> Result<()> {

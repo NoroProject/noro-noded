@@ -200,3 +200,22 @@ fn environment_is_stable_between_rebuilds() {
         vec!["AAA=1".to_string(), "TZ=UTC".to_string()]
     );
 }
+
+/// Своп в панели задаётся «сверх памяти», а докеру нужна сумма. Меньше памяти
+/// он не принимает вовсе, и сервер с 15 ГБ памяти и 4 ГБ свопа не создавался.
+#[test]
+fn swap_is_added_to_memory() {
+    let mut spec = spec();
+    spec.memory_mb = 15360;
+    spec.swap_mb = Some(4096);
+    assert_eq!(super::memory_swap(&spec), (15360 + 4096) * 1024 * 1024);
+
+    spec.swap_mb = Some(0);
+    assert_eq!(super::memory_swap(&spec), 15360 * 1024 * 1024);
+
+    spec.swap_mb = None;
+    assert_eq!(super::memory_swap(&spec), 15360 * 1024 * 1024);
+
+    spec.swap_mb = Some(-1);
+    assert_eq!(super::memory_swap(&spec), -1);
+}

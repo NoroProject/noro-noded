@@ -121,6 +121,25 @@ fn protocols(proto: PortProtocol) -> &'static [&'static str] {
     }
 }
 
+/// Общий предел «память плюс своп», как его понимает докер.
+///
+/// В панели своп задаётся так, как принято у людей: сколько его **сверх**
+/// памяти. Докеру нужна сумма, и своп, переданный ему напрямую, он не
+/// принимает, когда тот меньше памяти: «Minimum memoryswap limit should be
+/// larger than memory limit», и контейнер не создаётся вовсе. Сервер с 15 ГБ
+/// памяти и 4 ГБ свопа из-за этого не запускался ни разу.
+///
+/// Ноль — свопа нет: у докера это и выражается равенством пределов.
+/// Отрицательное — без предела.
+fn memory_swap(spec: &ServerSpec) -> i64 {
+    let memory = spec.memory_mb * 1024 * 1024;
+    match spec.swap_mb {
+        Some(swap) if swap < 0 => -1,
+        Some(swap) => memory + swap * 1024 * 1024,
+        None => memory,
+    }
+}
+
 fn host_config(args: CreateArgs<'_>) -> HostConfig {
     let spec = args.spec;
 
@@ -145,9 +164,7 @@ fn host_config(args: CreateArgs<'_>) -> HostConfig {
         )]),
         port_bindings: Some(bindings),
         memory: Some(spec.memory_mb * 1024 * 1024),
-        // Своп по умолчанию равен памяти: иначе докер разрешает контейнеру ещё
-        // столько же свопа сверху, и лимит перестаёт быть лимитом.
-        memory_swap: Some(spec.swap_mb.unwrap_or(spec.memory_mb) * 1024 * 1024),
+        memory_swap: Some(memory_swap(spec)),
         nano_cpus: (spec.cpu_percent > 0).then(|| spec.cpu_percent * 10_000_000),
         pids_limit: (spec.pids_limit > 0).then_some(spec.pids_limit),
         // Убийство по памяти должно оставаться убийством: с выключенным

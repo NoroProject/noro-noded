@@ -106,6 +106,17 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
     //    выглядит это как «не запускается».
     props::accept_eula(&root.join("eula.txt"))?;
     props::apply(&root.join("server.properties"), &spec.properties)?;
+    if let Some(port) = spec
+        .spec
+        .ports
+        .iter()
+        .find(|p| p.primary)
+        .map(|p| p.port)
+        .or_else(|| spec.spec.ports.first().map(|p| p.port))
+    {
+        let _ = ctx.layout.write_primary_port(port);
+        props::ensure_port(&root.join("server.properties"), port)?;
+    }
 
     // 5. authlib-injector — внутрь маунта, иначе контейнер его не увидит.
     if ensure_authlib(ctx.master, ctx.layout, &spec.spec).await? {

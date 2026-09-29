@@ -66,6 +66,31 @@ impl Engine {
         }
         Ok(out)
     }
+
+    /// Выделенный основной порт сервера: сначала из метки контейнера, затем из пробросов портов.
+    pub async fn primary_port(&self, server: uuid::Uuid) -> Option<u16> {
+        let name = Engine::container_name(server);
+        let inspect = self.docker.inspect_container(&name, None).await.ok()?;
+        if let Some(port) = inspect
+            .config
+            .and_then(|c| c.labels)
+            .and_then(|l| l.get(crate::docker::engine::LABEL_PRIMARY_PORT).cloned())
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            return Some(port);
+        }
+        if let Some(bindings) = inspect.host_config.and_then(|h| h.port_bindings) {
+            let mut ports: Vec<u16> = bindings
+                .keys()
+                .filter_map(|k| k.split('/').next()?.parse::<u16>().ok())
+                .collect();
+            ports.sort();
+            if let Some(port) = ports.first() {
+                return Some(*port);
+            }
+        }
+        None
+    }
 }
 
 fn state_of(state: Option<&bollard::models::ContainerSummaryStateEnum>) -> PowerState {

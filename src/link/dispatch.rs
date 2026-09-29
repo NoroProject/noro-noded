@@ -31,6 +31,18 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .prepare()
                 .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
 
+            if let Some(port) = spec
+                .ports
+                .iter()
+                .find(|p| p.primary)
+                .map(|p| p.port)
+                .or_else(|| spec.ports.first().map(|p| p.port))
+            {
+                let _ = layout.write_primary_port(port);
+                let _ =
+                    crate::server::props::ensure_port(&layout.root.join("server.properties"), port);
+            }
+
             // Чем запускать, решает диск, а не карточка сервера: имя мог
             // сменить установщик. Найденное уезжает в ответе — мастеру надо
             // запомнить его, иначе следующая пересборка начнёт с того же.
@@ -519,7 +531,10 @@ async fn power(daemon: &Daemon, server: Uuid, action: PowerAction) -> OpResult {
     // который мастер гасит этой же командой.
     let handle = daemon.registry.get_or_create(server);
     match action {
-        PowerAction::Start | PowerAction::Restart => handle.starting_on_purpose(),
+        PowerAction::Start | PowerAction::Restart => {
+            handle.starting_on_purpose();
+            daemon.ensure_server_port(server).await;
+        }
         PowerAction::Stop | PowerAction::Kill => handle.stopping_on_purpose(),
     }
 
@@ -623,5 +638,23 @@ pub async fn poll_states(engine: &Engine, registry: &Registry) -> Vec<NodeEvent>
 impl Daemon {
     pub fn layout(&self, server: Uuid) -> Layout {
         Layout::new(self.cfg.server_dir(server))
+    }
+
+    /// Гарантировать соответствие порта в `server.properties` выделенному порту.
+    pub async fn ensure_server_port(&self, server: Uuid) {
+        let layout = self.layout(server);
+        let port = match layout.read_primary_port() {
+            Some(p) => Some(p),
+            None => self.engine.primary_port(server).await,
+        };
+        if let Some(port) = port {
+            let _ = layout.write_primary_port(port);
+            let path = layout.root.join("server.properties");
+            if let Err(e) = crate::server::props::ensure_port(&path, port) {
+                tracing::warn!(%server, port, error = %e, "не удалось выставить порт в server.properties");
+            } else {
+                tracing::info!(%server, port, "порт в server.properties синхронизирован");
+            }
+        }
     }
 }

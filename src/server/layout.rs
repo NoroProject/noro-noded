@@ -50,6 +50,22 @@ impl Layout {
     pub fn backups_dir(&self) -> PathBuf {
         self.root.join(SERVICE_DIR).join("backups")
     }
+
+    pub fn primary_port_file(&self) -> PathBuf {
+        self.service_dir().join("primary_port")
+    }
+
+    pub fn read_primary_port(&self) -> Option<u16> {
+        std::fs::read_to_string(self.primary_port_file())
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+    }
+
+    pub fn write_primary_port(&self, port: u16) -> Result<()> {
+        std::fs::create_dir_all(self.service_dir())?;
+        std::fs::write(self.primary_port_file(), port.to_string())?;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]

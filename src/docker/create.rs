@@ -38,6 +38,19 @@ impl Engine {
         let mut labels = HashMap::new();
         labels.insert(LABEL_SERVER.to_string(), args.server.to_string());
         labels.insert(LABEL_MANAGED.to_string(), "true".to_string());
+        let primary_port = args
+            .spec
+            .ports
+            .iter()
+            .find(|p| p.primary)
+            .map(|p| p.port)
+            .or_else(|| args.spec.ports.first().map(|p| p.port));
+        if let Some(port) = primary_port {
+            labels.insert(
+                super::engine::LABEL_PRIMARY_PORT.to_string(),
+                port.to_string(),
+            );
+        }
 
         let body = ContainerCreateBody {
             image: Some(args.spec.image.clone()),

@@ -11,6 +11,7 @@ pub const NAME_PREFIX: &str = "noro-";
 /// перезапуска демона, даже если имя кто-то поменял руками.
 pub const LABEL_SERVER: &str = "dev.noro.server";
 pub const LABEL_MANAGED: &str = "dev.noro.managed";
+pub const LABEL_PRIMARY_PORT: &str = "dev.noro.primary_port";
 
 /// Куда примонтирован каталог сервера внутри контейнера.
 pub const CONTAINER_ROOT: &str = "/home/container";

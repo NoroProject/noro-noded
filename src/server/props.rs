@@ -51,6 +51,18 @@ pub fn accept_eula(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Гарантировать, что в `server.properties` выставлен правильный выделенный порт.
+/// Без этого распакованная сборка (например, с `server-port=25565`) или сервер,
+/// создавший файл при первом запуске, слушает не тот порт, на который докер
+/// пробрасывает трафик, и снаружи выглядит как `Connection refused`.
+pub fn ensure_port(path: &Path, port: u16) -> Result<()> {
+    let mut changes = BTreeMap::new();
+    changes.insert("server-port".into(), port.to_string());
+    changes.insert("query.port".into(), port.to_string());
+    changes.insert("server-ip".into(), String::new());
+    apply(path, &changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +113,28 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "server-port=25565\n"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_port_rewrites_server_port_and_clears_server_ip() {
+        let dir = std::env::temp_dir().join(format!("noded-props-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.properties");
+        std::fs::write(
+            &path,
+            "server-ip=127.0.0.1\nserver-port=25565\nquery.port=25565\nmotd=Custom\n",
+        )
+        .unwrap();
+
+        ensure_port(&path, 25500).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        assert!(text.contains("server-port=25500"));
+        assert!(text.contains("query.port=25500"));
+        assert!(text.contains("server-ip=\n"));
+        assert!(text.contains("motd=Custom"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

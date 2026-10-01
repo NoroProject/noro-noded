@@ -90,6 +90,7 @@ async fn pump(
             .await
             .unwrap_or((PowerState::Offline, None, 0));
     handle.set_power(power);
+    let stopped_by_user = handle.state().stopped_on_purpose;
     *handle.writer.lock().await = None;
 
     let _ = outbox
@@ -99,6 +100,7 @@ async fn pump(
             ready: false,
             uptime_secs: uptime,
             exit_code,
+            stopped_by_user,
         })
         .await;
 
@@ -179,5 +181,6 @@ fn state_event(
         ready: state.ready,
         uptime_secs,
         exit_code,
+        stopped_by_user: state.stopped_on_purpose,
     }
 }

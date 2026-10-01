@@ -623,12 +623,17 @@ pub async fn poll_states(engine: &Engine, registry: &Registry) -> Vec<NodeEvent>
             if let Some(handle) = registry.get(server) {
                 handle.set_power(power);
             }
+            let stopped_by_user = registry
+                .get(server)
+                .map(|h| h.state().stopped_on_purpose)
+                .unwrap_or(false);
             events.push(NodeEvent::ServerState {
                 server,
                 state: power,
                 ready: ready && power == PowerState::Running,
                 uptime_secs: uptime,
                 exit_code,
+                stopped_by_user,
             });
         }
     }

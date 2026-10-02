@@ -56,7 +56,7 @@ impl Engine {
             image: Some(args.spec.image.clone()),
             user: Some(format!("{CONTAINER_UID}:{CONTAINER_GID}")),
             working_dir: Some(CONTAINER_ROOT.to_string()),
-            cmd: Some(command_line(args.spec)),
+            cmd: Some(command_line_with_dir(args.spec, Some(args.host_dir))),
             env: Some(env_list(args.spec)),
             labels: Some(labels),
             // Консоль сервера — это stdin: команды уходят туда же, куда их
@@ -89,9 +89,25 @@ impl Engine {
 /// месте, что у враппера. Без него сервер с `online-mode=true` спрашивает
 /// аккаунты у Mojang и не пускает на себя вообще никого: игроки заходят
 /// лаунчером, а его учётки живут в нашем Yggdrasil.
-fn command_line(spec: &ServerSpec) -> Vec<String> {
+#[allow(dead_code)]
+pub fn command_line(spec: &ServerSpec) -> Vec<String> {
+    command_line_with_dir(spec, None)
+}
+
+pub fn command_line_with_dir(spec: &ServerSpec, host_dir: Option<&Path>) -> Vec<String> {
     let mut cmd = vec!["java".to_string()];
     cmd.extend(spec.jvm_args.clone());
+
+    // Если на диске есть java9args.txt (например, в GTNH под Java 17-25),
+    // передаём его как аргументный файл JVM, если он ещё не указан.
+    if let Some(dir) = host_dir {
+        if dir.join("java9args.txt").is_file()
+            && !cmd.iter().any(|arg| arg.contains("java9args.txt"))
+        {
+            cmd.push("@java9args.txt".to_string());
+        }
+    }
+
     if let Some(url) = &spec.authlib_url {
         cmd.push(format!(
             "-javaagent:{}={url}",

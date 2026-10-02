@@ -255,6 +255,11 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
 /// Если на диске не нашлось ничего похожего, оставляем присланное: отказ при
 /// старте с внятной строкой в логе честнее, чем подставленный наугад файл.
 pub fn resolve_entry_point(root: &Path, wanted: &str) -> String {
+    // Патч-рантайм новой Java для 1.7.10 (lwjgl3ify / GTNH) безусловно заменяет
+    // Forge-jar: он мог распаковаться из сервер-пака уже после установщика Forge.
+    if root.join("lwjgl3ify-forgePatches.jar").is_file() {
+        return "lwjgl3ify-forgePatches.jar".to_string();
+    }
     let exists = match wanted.strip_prefix('@') {
         Some(rel) => root.join(rel).is_file(),
         None => !wanted.is_empty() && root.join(wanted).is_file(),
@@ -302,17 +307,20 @@ fn find_installed_jar(root: &Path) -> Option<String> {
         })
         .collect();
 
-    // Порядок разбора важен: при нескольких кандидатах выигрывает тот, чьё имя
-    // прямо называет себя сервером, а не первый попавшийся в каталоге.
+    // Порядок разбора важен: загрузчики выигрывают у ванильного minecraft_server.jar.
     candidates.sort();
     let rank = |name: &str| {
         let lower = name.to_lowercase();
         match () {
-            _ if lower == "server.jar" => 0,
-            _ if lower.contains("server") => 1,
-            _ if lower.contains("forge") => 2,
-            _ if lower.contains("paper") || lower.contains("purpur") => 3,
-            _ => 4,
+            _ if lower.starts_with("lwjgl3ify") || lower.contains("retrofutura") => 0,
+            _ if lower == "server.jar" => 1,
+            _ if lower.contains("forge") && lower.contains("universal") => 2,
+            _ if lower.contains("forge") => 3,
+            _ if lower.contains("fabric") => 4,
+            _ if lower.contains("paper") || lower.contains("purpur") => 5,
+            _ if lower.starts_with("minecraft_server") => 10,
+            _ if lower.contains("server") => 6,
+            _ => 7,
         }
     };
     candidates.into_iter().min_by_key(|name| rank(name))
@@ -428,6 +436,30 @@ mod tests {
         assert_eq!(
             core_file_name("https://api.example.com/files/abc123"),
             "server.jar"
+        );
+    }
+
+    #[test]
+    fn forge_universal_wins_over_minecraft_server() {
+        let d = Dir::new();
+        d.file("minecraft_server.1.7.10.jar");
+        d.file("forge-1.7.10-10.13.4.1614-1.7.10-universal.jar");
+        d.file("forge-1.7.10-10.13.4.1614-1.7.10-installer.jar");
+        assert_eq!(
+            resolve_entry_point(&d.0, "server.jar"),
+            "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar"
+        );
+    }
+
+    #[test]
+    fn lwjgl3ify_wins_over_forge_universal() {
+        let d = Dir::new();
+        d.file("minecraft_server.1.7.10.jar");
+        d.file("forge-1.7.10-10.13.4.1614-1.7.10-universal.jar");
+        d.file("lwjgl3ify-forgePatches.jar");
+        assert_eq!(
+            resolve_entry_point(&d.0, "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar"),
+            "lwjgl3ify-forgePatches.jar"
         );
     }
 }

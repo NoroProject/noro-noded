@@ -141,6 +141,29 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .map_err(|e| OpError::new("panel_install_failed", format!("{e:#}")))
         }
 
+        NodeOp::ServerPackApply { server, pack } => {
+            // Пак меняет jar'ы и моды; под живой JVM это верное падение. Мастер
+            // гасит сервер сам — здесь страховка от гонки с кнопкой «Старт».
+            if let Ok((state, _, _)) = daemon.engine.state(server).await {
+                if matches!(
+                    state,
+                    PowerState::Running | PowerState::Starting | PowerState::Stopping
+                ) {
+                    return Err(OpError::new(
+                        "panel_install_failed",
+                        "сервер запущен: пак кладётся только на остановленный",
+                    ));
+                }
+            }
+            let layout = daemon.layout(server);
+            let laid = crate::server::pack::lay_down(&daemon.master, &layout, &pack)
+                .await
+                .map_err(|e| OpError::new("upstream_failed", format!("{e:#}")))?;
+            crate::server::layout::chown_recursive(&layout.root)
+                .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
+            Ok(json!({ "bytes": laid.bytes, "untracked": laid.untracked }))
+        }
+
         NodeOp::Power { server, action } => power(daemon, server, action).await,
 
         NodeOp::Command { server, line } => {

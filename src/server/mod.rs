@@ -4,6 +4,7 @@ pub mod agent;
 pub mod clone;
 pub mod install;
 pub mod layout;
+pub mod pack;
 pub mod ping;
 pub mod props;
 pub mod registry;

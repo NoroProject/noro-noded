@@ -52,6 +52,10 @@ pub async fn ensure_authlib(
     Ok(true)
 }
 
+/// Сервер ставили до того, как нода начала помнить файлы пака.
+pub const UNTRACKED_WARNING: &str = "у сервера нет списка файлов прошлого пака: \
+     его устаревшие моды не удалены — проверьте mods/";
+
 pub struct InstallCtx<'a> {
     pub engine: &'a Engine,
     pub master: &'a MasterClient,
@@ -69,23 +73,7 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
         .context("не подготовить каталог сервера")?;
     let _ = ctx.log.send("подготовлен каталог сервера".into()).await;
 
-    // 1. Ядро. Качает нода: это публичный артефакт, и гонять его через мастер
-    //    значит тратить его канал на то, что и так лежит в открытом доступе.
-    let core_name = core_file_name(&spec.core.url);
-    let core_path = root.join(&core_name);
-    let bytes = ctx
-        .master
-        .download(
-            &spec.core.url,
-            &core_path,
-            spec.core.sha1.as_deref(),
-            spec.core.sha256.as_deref(),
-        )
-        .await
-        .context("не скачать ядро сервера")?;
-    let _ = ctx.log.send(format!("ядро загружено: {core_name}")).await;
-
-    // 2. Образ — до установщика: он в этом же образе и запускается.
+    // 1. Образ: в нём и сервер работает, и установщик запускается.
     ctx.engine
         .pull_image(&spec.spec.image)
         .await
@@ -95,12 +83,39 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
         .send(format!("образ готов: {}", spec.spec.image))
         .await;
 
-    // 3. Установщик, если ядро им является.
-    let jar = if spec.core.installer {
-        run_installer(&ctx, spec, &core_name).await?
-    } else {
-        core_name.clone()
+    // 2. Серверный пак — раньше ядра. Пак, который несёт сервер целиком (GTNH:
+    //    Forge, его библиотеки и лаунчер lwjgl3ify), в ядре не нуждается, а
+    //    установщик старого Forge и не запускается на нужной такому паку Java.
+    let packed = match &spec.server_pack {
+        Some(pack) => {
+            let laid = crate::server::pack::lay_down(ctx.master, ctx.layout, pack).await?;
+            let _ = ctx
+                .log
+                .send(format!(
+                    "серверный пак разложен ({:.1} МБ)",
+                    laid.bytes as f64 / 1_048_576.0
+                ))
+                .await;
+            if laid.untracked {
+                let _ = ctx.log.send(UNTRACKED_WARNING.into()).await;
+            }
+            find_installed_jar(root).map(|jar| (jar, laid.bytes))
+        }
+        None => None,
     };
+
+    // 3. Ядро и установщик — если пак не принёс сервер сам.
+    let (jar, bytes) = match packed {
+        Some((jar, size)) => {
+            let _ = ctx
+                .log
+                .send(format!("сервер пришёл с паком: {jar}, ядро не ставится"))
+                .await;
+            (jar, size)
+        }
+        None => install_core(&ctx, spec).await?,
+    };
+    let jar = resolve_entry_point(root, &jar);
 
     // 4. EULA и свойства. Без eula.txt сервер пишет строку в лог и выходит —
     //    выглядит это как «не запускается».
@@ -156,7 +171,36 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
     crate::server::layout::chown_recursive(root)?;
     let _ = ctx.log.send("установка завершена".into()).await;
 
-    Ok(InstallResult { jar, bytes })
+    Ok(InstallResult {
+        jar,
+        bytes,
+        server_pack: spec.server_pack.is_some(),
+    })
+}
+
+/// Скачать ядро и, если это установщик, прогнать его. Ядро качает нода: это
+/// публичный артефакт, и гонять его через мастер значит тратить его канал на
+/// то, что и так лежит в открытом доступе.
+async fn install_core(ctx: &InstallCtx<'_>, spec: &InstallSpec) -> Result<(String, u64)> {
+    let core_name = core_file_name(&spec.core.url);
+    let bytes = ctx
+        .master
+        .download(
+            &spec.core.url,
+            &ctx.layout.root.join(&core_name),
+            spec.core.sha1.as_deref(),
+            spec.core.sha256.as_deref(),
+        )
+        .await
+        .context("не скачать ядро сервера")?;
+    let _ = ctx.log.send(format!("ядро загружено: {core_name}")).await;
+
+    let jar = if spec.core.installer {
+        run_installer(ctx, spec, &core_name).await?
+    } else {
+        core_name
+    };
+    Ok((jar, bytes))
 }
 
 /// Прогнать установщик в одноразовом контейнере и забрать то, что он собрал.

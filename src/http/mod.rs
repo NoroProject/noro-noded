@@ -31,7 +31,42 @@ pub fn router(daemon: Daemon) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/transfer/{ticket}", get(download).post(upload).put(upload))
+        .layer(axum::middleware::from_fn(cors))
         .with_state(daemon)
+}
+
+/// Разрешить браузеру ходить сюда с сайта панели.
+///
+/// Сайт и нода — разные адреса, и без этих заголовков браузер не отдавал
+/// странице ответ, а заливку файла (тело с типом файла) вообще не пускал:
+/// на предварительный `OPTIONS` нода отвечала 405. Любой источник — потому
+/// что вся авторизация здесь в одноразовом тикете, а не в куках браузера:
+/// чужой сайт без тикета ничего не получит, с тикетом — то же, что и наш.
+async fn cors(request: Request, next: axum::middleware::Next) -> Response {
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let mut response = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static("content-type"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        header::HeaderValue::from_static("600"),
+    );
+    response
 }
 
 /// Поднять слушателя. Ошибка привязки не валит демон: без прямой передачи он

@@ -241,6 +241,27 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .map_err(fs_error)
         }
 
+        NodeOp::FsCopy { server, from, to } => {
+            let root = daemon.cfg.server_dir(server);
+            // Копия занимает место ровно как заливка: без проверки квоты
+            // «скопировать world» обходит лимит диска в два щелчка.
+            let size = fs::resolve_existing(&root, &from)
+                .map(|src| fs::quota::dir_size(&src))
+                .unwrap_or(0);
+            daemon
+                .quota
+                .check(server, &root, size)
+                .await
+                .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
+            let measured = root.clone();
+            let result = blocking(move || fs::io::copy(&root, &from, &to))
+                .await
+                .map(|count| json!({ "count": count }))
+                .map_err(fs_error);
+            daemon.quota.measure(server, &measured).await;
+            result
+        }
+
         NodeOp::FsPull {
             server,
             url,

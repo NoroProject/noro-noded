@@ -115,9 +115,52 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// Скопировать файл или каталог целиком.
+///
+/// Обход не идёт по симлинкам: ссылка наружу, скопированная как файл, вынесла
+/// бы чужое содержимое внутрь сервера. Ссылки пропускаются вовсе — разрешатель
+/// путей их и так не открывает.
+pub fn copy(root: &Path, from: &str, to: &str) -> Result<u64> {
+    guard_hidden(from)?;
+    guard_hidden(to)?;
+    let src = super::resolve_existing(root, from)?;
+    let dst = super::resolve(root, to)?;
+    if dst.exists() {
+        bail!("цель уже существует");
+    }
+    if dst.starts_with(&src) {
+        bail!("каталог не копируется сам в себя");
+    }
+    if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&src, &dst)?;
+        return Ok(1);
+    }
+
+    let mut count = 0u64;
+    for entry in walkdir::WalkDir::new(&src).follow_links(false) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(&src)?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            std::fs::copy(entry.path(), &target)?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn guard_hidden(rel: &str) -> Result<()> {
     if super::is_hidden(rel) {
         bail!("служебный каталог недоступен");
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "io_tests.rs"]
+mod tests;

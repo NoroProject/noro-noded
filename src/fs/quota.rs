@@ -182,7 +182,7 @@ impl Quota {
 ///
 /// Симлинки не разворачиваются: файл, на который они указывают, либо уже
 /// посчитан внутри каталога, либо лежит снаружи и к серверу не относится.
-fn dir_size(root: &Path) -> u64 {
+pub fn dir_size(root: &Path) -> u64 {
     walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()

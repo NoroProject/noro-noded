@@ -94,20 +94,27 @@ fn stale_mods_go_away_but_only_inside_managed_roots() {
     assert_eq!(report.deleted, 1);
 }
 
-/// В сборке агента нет и быть не должно, а лежит он ровно там, где убирают
-/// лишнее. Без этой защиты каждая раскатка молча отключала бы сервер от мастера.
+/// В сборке агента и дополнений нет и быть не должно, а лежат они ровно там,
+/// где убирают лишнее. Без этой защиты каждая раскатка сносила бы их.
 #[test]
-fn the_agent_is_not_swept_away_by_a_build_rollout() {
+fn runtime_extensions_are_not_swept_away_by_a_build_rollout() {
     let s = Sandbox::new();
+    fs::create_dir_all(s.root.join("plugins")).unwrap();
     fs::write(s.root.join("mods/noro-agent.jar"), "jar").unwrap();
+    fs::write(s.root.join("mods/noro-chat.jar"), "chat").unwrap();
+    fs::write(s.root.join("plugins/noro-tab.jar"), "tab").unwrap();
     let mut report = SyncReport::default();
 
-    prune(&s.root, &policy(true), &wanted(&[]), &mut report);
+    let mut p = policy(true);
+    p.managed_roots.push("plugins".into());
+    prune(&s.root, &p, &wanted(&[]), &mut report);
 
     assert!(
         s.root.join("mods/noro-agent.jar").exists(),
         "агент на месте"
     );
+    assert!(s.root.join("mods/noro-chat.jar").exists(), "чат на месте");
+    assert!(s.root.join("plugins/noro-tab.jar").exists(), "таб на месте");
 }
 
 #[test]

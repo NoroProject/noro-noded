@@ -96,7 +96,7 @@ fn prune(root: &Path, policy: &SyncPolicy, wanted: &HashSet<String>, report: &mu
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
 
-        if wanted.contains(&rel) || is_kept(&rel, policy) || is_agent(&rel) {
+        if wanted.contains(&rel) || is_kept(&rel, policy) || is_runtime_extension(&rel) {
             continue;
         }
         if !in_managed_root(&rel, policy) {
@@ -125,11 +125,23 @@ fn in_managed_root(rel: &str, policy: &SyncPolicy) -> bool {
         .any(|root| rel == root || rel.starts_with(&format!("{root}/")))
 }
 
-/// Агент лежит в `mods/` или `plugins/` — ровно там, где синк убирает лишнее.
-/// В сборке его нет и быть не должно, так что уборка сносила бы его при каждой
-/// раскатке, а сервер после этого молча переставал отвечать мастеру.
-fn is_agent(rel: &str) -> bool {
-    rel == super::agent::rel_path("mods") || rel == super::agent::rel_path("plugins")
+/// Агент и дополнения (чат, таб) лежат в `mods/` или `plugins/` и `config/` —
+/// ровно там, где синк убирает лишнее. В сборке их нет и быть не должно, так
+/// что уборка сносила бы их при каждой раскатке.
+fn is_runtime_extension(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mods/noro-agent.jar"
+            | "plugins/noro-agent.jar"
+            | "mods/noro-chat.jar"
+            | "plugins/noro-chat.jar"
+            | "mods/noro-tab.jar"
+            | "plugins/noro-tab.jar"
+    ) || lower.starts_with("plugins/norotab/")
+        || lower.starts_with("plugins/norochat/")
+        || lower.starts_with("config/norotab/")
+        || lower.starts_with("config/norochat/")
 }
 
 fn is_kept(rel: &str, policy: &SyncPolicy) -> bool {

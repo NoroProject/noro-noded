@@ -270,6 +270,15 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
         } => {
             let root = daemon.cfg.server_dir(server);
             let path = fs::resolve(&root, &dest).map_err(|e| fs_error(e.into()))?;
+            if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if crate::server::sync::file_sha1(&path)
+                        .is_ok_and(|hash| hash.eq_ignore_ascii_case(&sha1))
+                    {
+                        return Ok(json!({ "bytes": meta.len(), "cached": true }));
+                    }
+                }
+            }
             daemon
                 .master
                 .download(&url, &path, Some(&sha1), None)

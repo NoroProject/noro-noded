@@ -21,11 +21,6 @@ pub fn jar_path(root: &Path, dir: &str) -> PathBuf {
     root.join(dir).join(JAR_NAME)
 }
 
-/// Относительный путь — им же синк сборки защищает агент от уборки.
-pub fn rel_path(dir: &str) -> String {
-    format!("{dir}/{JAR_NAME}")
-}
-
 pub async fn install(master: &MasterClient, root: &Path, spec: &AgentSpec) -> Result<u64> {
     // Каталог выбирает мастер по платформе, но приходит он строкой: пускать её
     // в путь без проверки — это запись куда угодно по дереву сервера.
@@ -36,6 +31,16 @@ pub async fn install(master: &MasterClient, root: &Path, spec: &AgentSpec) -> Re
     let path = jar_path(root, &spec.dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    if path.is_file() {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if crate::server::sync::file_sha1(&path)
+                .is_ok_and(|hash| hash.eq_ignore_ascii_case(&spec.sha1))
+            {
+                return Ok(meta.len());
+            }
+        }
     }
 
     master

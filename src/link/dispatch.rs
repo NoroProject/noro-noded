@@ -214,6 +214,10 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
 
             fs::io::write_text(&root, &path, &content)
                 .map(|_| {
+                    let p = root.join(&path);
+                    if let Err(e) = crate::server::layout::chown_path(&p) {
+                        tracing::warn!(server = %server, error = %e, "config file owner not corrected");
+                    }
                     daemon.quota.add(server, content.len() as u64);
                     Value::Null
                 })

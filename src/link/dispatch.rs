@@ -48,7 +48,7 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             // запомнить его, иначе следующая пересборка начнёт с того же.
             let mut spec = *spec;
             spec.jar = install::resolve_entry_point(&layout.root, &spec.jar);
-            let spec = Box::new(spec);
+            let mut spec = Box::new(spec);
 
             // Лимит кладётся на диск рядом с сервером: демон перезапускается, а
             // квота должна знать потолок и после этого — в памяти он бы пропал.
@@ -78,6 +78,25 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             let running = daemon.engine.was_running(server).await;
             let handle = daemon.registry.get_or_create(server);
             if daemon.engine.exists(server).await {
+                // Служебные переменные (NORO_AGENT_SECRET и др.) переносим из прежнего
+                // контейнера, если мастер не прислал новые явно.
+                if let Ok(inspect) = daemon
+                    .engine
+                    .docker
+                    .inspect_container(&crate::docker::engine::Engine::container_name(server), None)
+                    .await
+                {
+                    if let Some(existing_env) = inspect.config.and_then(|c| c.env) {
+                        for entry in existing_env {
+                            if let Some((k, v)) = entry.split_once('=') {
+                                if k.starts_with("NORO_") && !spec.env.contains_key(k) {
+                                    spec.env.insert(k.to_string(), v.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if running {
                     handle.stopping_on_purpose();
                     daemon.engine.stop(server).await.ok();

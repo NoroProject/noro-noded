@@ -47,7 +47,11 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             // сменить установщик. Найденное уезжает в ответе — мастеру надо
             // запомнить его, иначе следующая пересборка начнёт с того же.
             let mut spec = *spec;
-            spec.jar = install::resolve_entry_point(&layout.root, &spec.jar);
+            // Сервер из собственного образа (лимбо) запускается точкой входа образа:
+            // jar, найденный в его каталоге, превратил бы его в Java-сервер.
+            if !(spec.jar.is_empty() && !spec.image.starts_with("eclipse-temurin:")) {
+                spec.jar = install::resolve_entry_point(&layout.root, &spec.jar);
+            }
             let mut spec = Box::new(spec);
 
             // Лимит кладётся на диск рядом с сервером: демон перезапускается, а

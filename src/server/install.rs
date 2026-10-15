@@ -105,7 +105,16 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
     };
 
     // 3. Ядро и установщик — если пак не принёс сервер сам.
+    //    Ядро без ссылки — сервер целиком в образе (лимбо): ставить нечего,
+    //    запускает его точка входа образа.
     let (jar, bytes) = match packed {
+        None if spec.core.url.is_empty() => {
+            let _ = ctx
+                .log
+                .send("сервер поставляется образом, ядро не ставится".into())
+                .await;
+            (String::new(), 0)
+        }
         Some((jar, size)) => {
             let _ = ctx
                 .log
@@ -115,7 +124,11 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
         }
         None => install_core(&ctx, spec).await?,
     };
-    let jar = resolve_entry_point(root, &jar);
+    let jar = if spec.core.url.is_empty() && spec.server_pack.is_none() {
+        jar
+    } else {
+        resolve_entry_point(root, &jar)
+    };
 
     // 4. EULA и свойства. Без eula.txt сервер пишет строку в лог и выходит —
     //    выглядит это как «не запускается».

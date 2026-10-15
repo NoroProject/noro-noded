@@ -56,7 +56,7 @@ impl Engine {
             image: Some(args.spec.image.clone()),
             user: Some(format!("{CONTAINER_UID}:{CONTAINER_GID}")),
             working_dir: Some(CONTAINER_ROOT.to_string()),
-            cmd: Some(command_line_with_dir(args.spec, Some(args.host_dir))),
+            cmd: container_cmd(args.spec, args.host_dir),
             env: Some(env_list(args.spec)),
             labels: Some(labels),
             // Консоль сервера — это stdin: команды уходят туда же, куда их
@@ -78,6 +78,12 @@ impl Engine {
         let created = self.docker.create_container(Some(options), body).await?;
         Ok(created.id)
     }
+}
+
+/// Без jar это не Java-сервер, а образ со своей точкой входа (лимбо на Pumpkin,
+/// PicoLimbo): команду задаёт он сам, нода только даёт окружение и маунт.
+pub fn container_cmd(spec: &ServerSpec, host_dir: &Path) -> Option<Vec<String>> {
+    (!spec.jar.is_empty()).then(|| command_line_with_dir(spec, Some(host_dir)))
 }
 
 /// Команда запуска: java + аргументы JVM + authlib + jar + аргументы сервера.

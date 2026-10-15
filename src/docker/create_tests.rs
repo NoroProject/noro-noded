@@ -51,6 +51,15 @@ fn a_plain_jar_is_launched_with_dash_jar() {
     );
 }
 
+#[test]
+fn an_image_without_a_jar_keeps_its_own_entrypoint() {
+    let mut s = spec();
+    s.image = "ghcr.io/noroproject/noro-limbo:latest".into();
+    s.jar = String::new();
+    assert_eq!(container_cmd(&s, args_for(&s).host_dir), None);
+    assert!(container_cmd(&spec(), args_for(&spec()).host_dir).is_some());
+}
+
 /// Без `-javaagent` сервер спрашивает аккаунты у Mojang, а игроки заходят
 /// лаунчером: `online-mode=true` тогда не пускает вообще никого.
 #[test]

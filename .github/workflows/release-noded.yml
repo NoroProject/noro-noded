@@ -34,14 +34,16 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
   IMAGE: noroproject/noded
 
-# Everything runs on the organisation's self-hosted arm64 runner: GitHub's hosted
-# runners stop as soon as the account's minutes run out or a payment fails, and
-# the release then never happens. Only aarch64 is built for now — the one
-# architecture the nodes run on; x86_64 comes back with an x86 runner.
+# Everything runs on this repository's own self-hosted arm64 runner (label
+# `noded`): GitHub's hosted runners stop as soon as the account's minutes run out
+# or a payment fails, and the release then never happens. The organisation's
+# runner group does not serve public repositories. Only aarch64 is built for
+# now — the one architecture the nodes run on; x86_64 comes back with an x86
+# runner.
 jobs:
   guard:
     name: Check the tag
-    runs-on: [self-hosted, linux, arm64]
+    runs-on: [self-hosted, noded]
     steps:
       # The master hands out the version it read from the tag, while the daemon
       # reports its own CARGO_PKG_VERSION in `hello`. If they drift, the panel
@@ -62,7 +64,10 @@ jobs:
   build:
     name: noded ${{ matrix.target }}
     needs: guard
-    runs-on: [self-hosted, linux, arm64]
+    runs-on: [self-hosted, noded]
+    # The toolchain and the C linker live in the container, not on the machine
+    # the runner shares with production.
+    container: rust:1-bookworm
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +119,7 @@ jobs:
   release:
     name: Publish release
     needs: build
-    runs-on: [self-hosted, linux, arm64]
+    runs-on: [self-hosted, noded]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -131,7 +136,7 @@ jobs:
   image:
     name: Docker image
     needs: build
-    runs-on: [self-hosted, linux, arm64]
+    runs-on: [self-hosted, noded]
     # Without credentials the binaries are still released: the container is one
     # of two ways to run the daemon, not the only one.
     if: ${{ github.event_name == 'push' || inputs.job_id != '' }}

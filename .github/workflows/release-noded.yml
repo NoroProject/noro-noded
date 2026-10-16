@@ -72,6 +72,10 @@ jobs:
     # The toolchain and the C linker live in the container, not on the machine
     # the runner shares with production.
     container: rust:1-bookworm
+    # Steps in a container default to sh (dash), which has no `pipefail`.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:

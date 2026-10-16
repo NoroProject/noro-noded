@@ -34,10 +34,14 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
   IMAGE: noroproject/noded
 
+# Everything runs on the organisation's self-hosted arm64 runner: GitHub's hosted
+# runners stop as soon as the account's minutes run out or a payment fails, and
+# the release then never happens. Only aarch64 is built for now — the one
+# architecture the nodes run on; x86_64 comes back with an x86 runner.
 jobs:
   guard:
     name: Check the tag
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64]
     steps:
       # The master hands out the version it read from the tag, while the daemon
       # reports its own CARGO_PKG_VERSION in `hello`. If they drift, the panel
@@ -58,12 +62,11 @@ jobs:
   build:
     name: noded ${{ matrix.target }}
     needs: guard
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
           - target: aarch64-unknown-linux-gnu
 
     steps:
@@ -90,18 +93,9 @@ jobs:
         with:
           key: noded-${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
+      # The runner is arm64 itself, so the build is native: no cross, no QEMU.
       - name: Build
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
 
       # The name carries the target: the master picks the asset by the node's
       # architecture, which it learns from `hello`.
@@ -120,7 +114,7 @@ jobs:
   release:
     name: Publish release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -137,7 +131,7 @@ jobs:
   image:
     name: Docker image
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64]
     # Without credentials the binaries are still released: the container is one
     # of two ways to run the daemon, not the only one.
     if: ${{ github.event_name == 'push' || inputs.job_id != '' }}
@@ -146,7 +140,6 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
@@ -162,7 +155,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}

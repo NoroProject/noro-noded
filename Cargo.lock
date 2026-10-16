@@ -2833,6 +2833,7 @@ dependencies = [
 [[package]]
 name = "schema"
 version = "3.0.0"
+source = "git+https://github.com/NoroProject/noro-shared.git?branch=master#6803b0529aa40be604eec9e12a97a662f153c0e7"
 dependencies = [
  "chrono",
  "once_cell",

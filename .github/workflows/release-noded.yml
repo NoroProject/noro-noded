@@ -124,6 +124,13 @@ jobs:
           name: noded-${{ matrix.target }}
           path: dist/*
 
+      # The container builds as root, and the workspace is shared with the jobs
+      # that run on the host: hand it back to the runner's user, or their
+      # checkout cannot clean it.
+      - name: Give the workspace back to the runner
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"
+
   release:
     name: Publish release
     needs: build

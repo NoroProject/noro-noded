@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "noded"
-version = "3.1.11"
+version = "3.1.12"
 dependencies = [
  "anyhow",
  "axum",

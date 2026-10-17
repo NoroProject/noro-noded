@@ -15,7 +15,9 @@ impl Engine {
         if !image_allowed(image) {
             bail!("образ {image} не из разрешённого списка");
         }
-        if self.docker.inspect_image(image).await.is_ok() {
+        // Тег latest мутабелен: если локальный образ уже есть, его всё равно нужно обновить.
+        let is_latest = !image.contains(':') || image.ends_with(":latest");
+        if !is_latest && self.docker.inspect_image(image).await.is_ok() {
             return Ok(());
         }
 

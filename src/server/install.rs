@@ -41,15 +41,50 @@ pub async fn ensure_authlib(
         return Ok(false);
     }
     let jar = layout.authlib_jar();
-    if jar.is_file() {
-        return Ok(false);
+    let downloaded = if !jar.is_file() {
+        let url = format!("{}{AUTHLIB_PATH}", master.base());
+        master
+            .download(&url, &jar, None, None)
+            .await
+            .context("не скачать authlib-injector")?;
+        true
+    } else {
+        false
+    };
+    let _ = sync_user_jvm_args(&layout.root, spec.authlib_url.as_deref());
+    Ok(downloaded)
+}
+
+/// Синхронизировать `-javaagent` authlib-injector в `user_jvm_args.txt`.
+///
+/// Forge (1.17+) и NeoForge читают `@user_jvm_args.txt`. Кроме того, сторонние
+/// стартеры (ServerStarter и др.) запускают дочерний Java-процесс именно через
+/// `@user_jvm_args.txt`, теряя `-javaagent` родительского контейнера.
+/// Добавление агента в `user_jvm_args.txt` гарантирует, что и дочерний процесс
+/// сервера запустится с нашим Yggdrasil API.
+pub fn sync_user_jvm_args(root: &Path, authlib_url: Option<&str>) -> Result<()> {
+    let path = root.join("user_jvm_args.txt");
+    if !path.is_file() {
+        return Ok(());
     }
-    let url = format!("{}{AUTHLIB_PATH}", master.base());
-    master
-        .download(&url, &jar, None, None)
-        .await
-        .context("не скачать authlib-injector")?;
-    Ok(true)
+    let content = std::fs::read_to_string(&path)?;
+    let mut lines: Vec<String> = content
+        .lines()
+        .filter(|line| !line.trim().contains("authlib-injector.jar"))
+        .map(|s| s.to_string())
+        .collect();
+
+    if let Some(url) = authlib_url {
+        lines.push(format!(
+            "-javaagent:{}={url}",
+            crate::server::layout::Layout::container_authlib_jar()
+        ));
+    }
+
+    let mut result = lines.join("\n");
+    result.push('\n');
+    std::fs::write(&path, result)?;
+    Ok(())
 }
 
 /// Сервер ставили до того, как нода начала помнить файлы пака.
@@ -317,6 +352,15 @@ pub fn resolve_entry_point(root: &Path, wanted: &str) -> String {
     if root.join("lwjgl3ify-forgePatches.jar").is_file() {
         return "lwjgl3ify-forgePatches.jar".to_string();
     }
+    // Если на диске есть unix_args.txt (Forge/NeoForge 1.17+), он всегда выигрывает
+    // у обёрток вроде `minecraft_server.jar` или `server.jar`.
+    if wanted.is_empty() || wanted == "minecraft_server.jar" || wanted == "server.jar" {
+        if let Some(installed) = find_installed_jar(root) {
+            if installed.starts_with('@') {
+                return installed;
+            }
+        }
+    }
     let exists = match wanted.strip_prefix('@') {
         Some(rel) => root.join(rel).is_file(),
         None => !wanted.is_empty() && root.join(wanted).is_file(),
@@ -518,5 +562,33 @@ mod tests {
             resolve_entry_point(&d.0, "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar"),
             "lwjgl3ify-forgePatches.jar"
         );
+    }
+
+    #[test]
+    fn unix_args_wins_over_minecraft_server() {
+        let d = Dir::new();
+        d.file("minecraft_server.jar");
+        d.file("libraries/net/minecraftforge/forge/1.20.1-47.4.13/unix_args.txt");
+        assert_eq!(
+            resolve_entry_point(&d.0, "minecraft_server.jar"),
+            "@libraries/net/minecraftforge/forge/1.20.1-47.4.13/unix_args.txt"
+        );
+    }
+
+    #[test]
+    fn sync_user_jvm_args_updates_agent() {
+        let d = Dir::new();
+        let path = d.0.join("user_jvm_args.txt");
+        std::fs::write(&path, "# comment\n-Xmx4G\n").unwrap();
+        sync_user_jvm_args(&d.0, Some("https://example.com/api/yggdrasil")).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("-javaagent:"));
+        assert!(updated.contains("https://example.com/api/yggdrasil"));
+
+        // Удаление при None
+        sync_user_jvm_args(&d.0, None).unwrap();
+        let removed = std::fs::read_to_string(&path).unwrap();
+        assert!(!removed.contains("-javaagent:"));
+        assert!(removed.contains("-Xmx4G"));
     }
 }

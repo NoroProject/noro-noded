@@ -18,11 +18,15 @@ fn handshake(host: &str, port: u16, next_state: i32) -> Vec<u8> {
 #[test]
 fn the_wanted_state_is_read_out_of_the_handshake() {
     assert_eq!(
-        parse_handshake(&handshake("noro.example", 25565, 1)).unwrap(),
+        parse_handshake(&handshake("noro.example", 25565, 1))
+            .unwrap()
+            .next_state,
         1
     );
     assert_eq!(
-        parse_handshake(&handshake("noro.example", 25565, 2)).unwrap(),
+        parse_handshake(&handshake("noro.example", 25565, 2))
+            .unwrap()
+            .next_state,
         2
     );
 }

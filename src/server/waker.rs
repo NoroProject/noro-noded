@@ -110,11 +110,14 @@ async fn serve(
     wake: WakeFn,
 ) -> Result<()> {
     let handshake = read_packet(&mut stream).await?;
-    let next_state = parse_handshake(&handshake)?;
+    let Handshake {
+        protocol,
+        next_state,
+    } = parse_handshake(&handshake)?;
 
     match next_state {
         STATE_STATUS => {
-            answer_status(&mut stream, listing).await?;
+            answer_status(&mut stream, listing, protocol).await?;
             // The client sends a ping right after the status and waits for it
             // back; without the echo the server list shows "no connection"
             // instead of the motd we just sent.
@@ -134,15 +137,21 @@ async fn serve(
     }
 }
 
-/// Only the last field of the handshake matters: what the client wants next.
-fn parse_handshake(body: &[u8]) -> Result<i32> {
+/// What the handshake says: the client's protocol and what it wants next.
+#[derive(Debug, PartialEq, Eq)]
+struct Handshake {
+    protocol: i32,
+    next_state: i32,
+}
+
+fn parse_handshake(body: &[u8]) -> Result<Handshake> {
     let mut cursor = body;
     let packet_id = read_varint(&mut cursor)?;
     if packet_id != 0x00 {
         bail!("first packet is not a handshake: {packet_id}");
     }
 
-    let _protocol = read_varint(&mut cursor)?;
+    let protocol = read_varint(&mut cursor)?;
     let host_len = read_varint(&mut cursor)? as usize;
     if host_len > cursor.len() {
         bail!("handshake host longer than the packet");
@@ -153,21 +162,26 @@ fn parse_handshake(body: &[u8]) -> Result<i32> {
     }
     cursor = &cursor[2..];
 
-    read_varint(&mut cursor)
+    let next_state = read_varint(&mut cursor)?;
+    Ok(Handshake {
+        protocol,
+        next_state,
+    })
 }
 
-async fn answer_status(stream: &mut TcpStream, listing: &Listing) -> Result<()> {
-    // The version line is drawn by the client only when the protocol does not
-    // match — and here it never does, on purpose: the one answering is not a
-    // server, and saying "1.21.1" would be a lie the client then acts on.
-    let version = if listing.version_name.is_empty() {
-        listing.motd.as_str()
+async fn answer_status(stream: &mut TcpStream, listing: &Listing, client: i32) -> Result<()> {
+    // The client draws the version text in place of the player count only when
+    // the protocol is not its own. Without a text of the owner's it gets the count:
+    // answering with its own protocol. The MOTD used to stand in for the text, and
+    // the list showed the description twice.
+    let protocol = if listing.version_name.is_empty() {
+        client
     } else {
-        listing.version_name.as_str()
+        listing.protocol
     };
 
     let mut status = serde_json::json!({
-        "version": { "name": version, "protocol": listing.protocol },
+        "version": { "name": listing.version_name, "protocol": protocol },
         "players": { "online": 0, "max": 0, "sample": [] },
         "description": { "text": listing.motd },
     });

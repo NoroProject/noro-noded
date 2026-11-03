@@ -4,6 +4,8 @@ The node daemon of the Noro hosting panel. It runs Minecraft servers in Docker
 on one machine and takes its orders from the master over a single outgoing
 WebSocket — so a node works from behind NAT, without any inbound port.
 
+Documentation: **[https://noro.rest/docs](https://noro.rest/docs)**
+
 One daemon serves as many servers as the machine holds: console, power, files,
 build rollout, backups, schedules and SFTP all travel over that one socket.
 

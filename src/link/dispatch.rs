@@ -174,7 +174,8 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
                 let dir = daemon.cfg.server_dir(server);
                 let _ = std::fs::remove_file(fs::quota::limits_path(&dir));
                 if dir.exists() {
-                    std::fs::remove_dir_all(&dir)
+                    blocking(move || Ok(std::fs::remove_dir_all(&dir)?))
+                        .await
                         .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
                 }
             }
@@ -244,8 +245,14 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
         NodeOp::ConsoleAttach { server } => attach(daemon, server).await,
         NodeOp::ConsoleDetach { .. } => Ok(Value::Null),
 
+        // Файловые операции — в блокирующем пуле, как и тяжёлые ниже: каталог
+        // на десятки тысяч файлов, удаление мира или медленный диск стоят
+        // секунд, и на рабочем потоке рантайма они останавливали консоли и
+        // связь с мастером для всей ноды.
         NodeOp::FsList { server, path } => {
-            fs::list::list_dir(&daemon.cfg.server_dir(server), &path)
+            let root = daemon.cfg.server_dir(server);
+            blocking(move || fs::list::list_dir(&root, &path))
+                .await
                 .map(|l| serde_json::to_value(l).unwrap_or(Value::Null))
                 .map_err(fs_error)
         }
@@ -254,9 +261,13 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             server,
             path,
             max_bytes,
-        } => fs::io::read_text(&daemon.cfg.server_dir(server), &path, max_bytes)
-            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-            .map_err(fs_error),
+        } => {
+            let root = daemon.cfg.server_dir(server);
+            blocking(move || fs::io::read_text(&root, &path, max_bytes))
+                .await
+                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+                .map_err(fs_error)
+        }
 
         NodeOp::FsWrite {
             server,
@@ -271,34 +282,51 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .await
                 .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
 
-            fs::io::write_text(&root, &path, &content)
-                .map(|written| {
-                    if let Err(e) = crate::server::layout::chown_path(&written) {
-                        tracing::warn!(server = %server, error = %e, "config file owner not corrected");
-                    }
-                    daemon.quota.add(server, content.len() as u64);
-                    Value::Null
-                })
-                .map_err(fs_error)
+            let size = content.len() as u64;
+            blocking(move || {
+                let written = fs::io::write_text(&root, &path, &content)?;
+                if let Err(e) = crate::server::layout::chown_path(&written) {
+                    tracing::warn!(server = %server, error = %e, "config file owner not corrected");
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| {
+                daemon.quota.add(server, size);
+                Value::Null
+            })
+            .map_err(fs_error)
         }
 
         NodeOp::FsDelete { server, paths } => {
             let root = daemon.cfg.server_dir(server);
-            for path in &paths {
-                fs::io::delete(&root, path).map_err(fs_error)?;
-            }
-            // Пересчитываем сразу: иначе освобождённое место «появится» только
-            // через минуту, и уборка ради заливки выглядела бы бесполезной.
+            let target = root.clone();
+            let deleted = blocking(move || {
+                for path in &paths {
+                    fs::io::delete(&target, path)?;
+                }
+                Ok(())
+            })
+            .await;
+            // Пересчитываем сразу, и после частичной неудачи тоже: иначе
+            // освобождённое место «появится» только через минуту, и уборка
+            // ради заливки выглядела бы бесполезной.
             daemon.quota.measure(server, &root).await;
-            Ok(Value::Null)
+            deleted.map(|_| Value::Null).map_err(fs_error)
         }
 
-        NodeOp::FsMkdir { server, path } => fs::io::mkdir(&daemon.cfg.server_dir(server), &path)
-            .map(|_| Value::Null)
-            .map_err(fs_error),
+        NodeOp::FsMkdir { server, path } => {
+            let root = daemon.cfg.server_dir(server);
+            blocking(move || fs::io::mkdir(&root, &path))
+                .await
+                .map(|_| Value::Null)
+                .map_err(fs_error)
+        }
 
         NodeOp::FsRename { server, from, to } => {
-            fs::io::rename(&daemon.cfg.server_dir(server), &from, &to)
+            let root = daemon.cfg.server_dir(server);
+            blocking(move || fs::io::rename(&root, &from, &to))
+                .await
                 .map(|_| Value::Null)
                 .map_err(fs_error)
         }
@@ -307,9 +335,14 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             let root = daemon.cfg.server_dir(server);
             // Копия занимает место ровно как заливка: без проверки квоты
             // «скопировать world» обходит лимит диска в два щелчка.
-            let size = fs::resolve_existing(&root, &from)
-                .map(|src| fs::quota::dir_size(&src))
-                .unwrap_or(0);
+            let (src_root, source) = (root.clone(), from.clone());
+            let size = blocking(move || {
+                Ok(fs::resolve_existing(&src_root, &source)
+                    .map(|src| fs::quota::dir_size(&src))
+                    .unwrap_or(0))
+            })
+            .await
+            .unwrap_or(0);
             daemon
                 .quota
                 .check(server, &root, size)
@@ -599,8 +632,8 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
         NodeOp::BackupDelete { server, backup } => {
             let root = daemon.cfg.server_dir(server);
             let archive = crate::backup::archive_path(&root, backup);
-            if archive.exists() {
-                std::fs::remove_file(&archive)
+            if std::fs::symlink_metadata(&archive).is_ok() {
+                fs::nofollow::remove(&archive)
                     .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
             }
             Ok(Value::Null)

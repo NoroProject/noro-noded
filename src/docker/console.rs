@@ -1,3 +1,4 @@
+// Файл превышает 150 строк: чтение потока, нарезка на строки и склейка в кадры — одна труба, и врозь её не проследить.
 //! Консоль сервера: stdout контейнера наружу, команды — в stdin.
 //!
 //! Строки не отправляются по одной. Стартовый стектрейс модов — это сотни
@@ -21,6 +22,10 @@ pub const FLUSH_WINDOW: Duration = Duration::from_millis(50);
 pub const MAX_LINES_PER_FRAME: usize = 200;
 /// Признак готовности сервера — та же строка, по которой его узнаёт враппер.
 pub const READY_MARKER: &str = "Done (";
+/// Самая длинная строка, которая уходит целиком. Строку без перевода, которую
+/// печатает сломанный мод или бинарный мусор в stdout, демон иначе копил в
+/// памяти без предела.
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
 pub struct ConsoleBatch {
     pub lines: Vec<String>,
@@ -55,7 +60,8 @@ pub async fn attach(
     tokio::spawn(async move {
         let mut buffer: Vec<String> = Vec::new();
         let mut skipped: u32 = 0;
-        let mut partial = String::new();
+        let mut splitter = LineSplitter::default();
+        let mut lines = Vec::new();
         let mut ticker = tokio::time::interval(FLUSH_WINDOW);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -64,13 +70,8 @@ pub async fn attach(
                 chunk = output.next() => {
                     match chunk {
                         Some(Ok(out)) => {
-                            partial.push_str(&decode(out));
-                            // Последний кусок без перевода строки остаётся в
-                            // буфере: иначе строка рвётся пополам ровно там,
-                            // где докер решил отдать пакет.
-                            while let Some(pos) = partial.find('\n') {
-                                let line: String = partial.drain(..=pos).collect();
-                                let line = line.trim_end_matches(['\n', '\r']).to_string();
+                            splitter.feed(&payload(out), &mut lines);
+                            for line in lines.drain(..) {
                                 if buffer.len() < MAX_LINES_PER_FRAME {
                                     buffer.push(line);
                                 } else {
@@ -130,14 +131,61 @@ impl ConsoleWriter {
     }
 }
 
-fn decode(out: LogOutput) -> String {
-    let bytes = match out {
+fn payload(out: LogOutput) -> bytes::Bytes {
+    match out {
         LogOutput::StdOut { message }
         | LogOutput::StdErr { message }
         | LogOutput::Console { message }
         | LogOutput::StdIn { message } => message,
-    };
-    String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Нарезка потока байт на строки.
+///
+/// Режется по байту перевода строки, а в текст превращается только целая
+/// строка: докер отдаёт пакеты где придётся, и буква кириллицы, разрезанная
+/// между двумя пакетами, при раздельном разборе становилась парой `�`.
+///
+/// Последний кусок без перевода строки остаётся в буфере до следующего пакета,
+/// но не длиннее `MAX_LINE_BYTES`: хвост сверх него отбрасывается до конца
+/// строки, а сама строка помечается обрезанной.
+#[derive(Default)]
+struct LineSplitter {
+    partial: Vec<u8>,
+    cut: bool,
+}
+
+impl LineSplitter {
+    fn feed(&mut self, mut bytes: &[u8], out: &mut Vec<String>) {
+        while let Some(pos) = bytes.iter().position(|b| *b == b'\n') {
+            self.append(&bytes[..pos]);
+            out.push(self.take_line());
+            bytes = &bytes[pos + 1..];
+        }
+        self.append(bytes);
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let room = MAX_LINE_BYTES.saturating_sub(self.partial.len());
+        if bytes.len() > room {
+            self.partial.extend_from_slice(&bytes[..room]);
+            self.cut = true;
+        } else {
+            self.partial.extend_from_slice(bytes);
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        if self.partial.last() == Some(&b'\r') {
+            self.partial.pop();
+        }
+        let mut line = String::from_utf8_lossy(&self.partial).into_owned();
+        if std::mem::take(&mut self.cut) {
+            line.push_str(" …");
+        }
+        self.partial.clear();
+        line
+    }
 }
 
 /// Сервер отпечатал признак готовности.
@@ -148,6 +196,42 @@ pub fn marks_ready(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split(chunks: &[&[u8]]) -> Vec<String> {
+        let mut splitter = LineSplitter::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            splitter.feed(chunk, &mut out);
+        }
+        out
+    }
+
+    /// «Ж» — два байта; докер вправе отдать их разными пакетами.
+    #[test]
+    fn a_letter_split_between_packets_stays_whole() {
+        let text = "Привет\n".as_bytes();
+        assert_eq!(split(&[&text[..3], &text[3..]]), vec!["Привет"]);
+    }
+
+    #[test]
+    fn crlf_and_unfinished_lines_are_handled() {
+        assert_eq!(split(&[b"a\r\nb", b"c\n", b"tail"]), vec!["a", "bc"]);
+    }
+
+    #[test]
+    fn an_endless_line_is_cut_and_does_not_grow() {
+        let mut splitter = LineSplitter::default();
+        let mut out = Vec::new();
+        let junk = vec![b'x'; MAX_LINE_BYTES];
+        for _ in 0..10 {
+            splitter.feed(&junk, &mut out);
+        }
+        assert!(splitter.partial.len() <= MAX_LINE_BYTES, "буфер не растёт");
+        splitter.feed(b"\nnext\n", &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].ends_with(" …"), "обрезанная строка помечена");
+        assert_eq!(out[1], "next");
+    }
 
     #[test]
     fn the_ready_marker_is_the_vanilla_one() {

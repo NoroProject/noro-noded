@@ -275,8 +275,10 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
         host_config: Some(crate::docker::create::locked_down(HostConfig {
             binds: Some(vec![format!("{}:{CONTAINER_ROOT}", ctx.host_dir.display())]),
             // Установщику нужна сеть — он тянет библиотеки, — но не нужно
-            // ничего сверх неё.
+            // ничего сверх неё. Потолок процессов — потому что это чужой код:
+            // без него форк-бомба в установщике клала бы всю машину.
             memory: Some(2048 * 1024 * 1024),
+            pids_limit: Some(512),
             ..Default::default()
         })),
         ..Default::default()

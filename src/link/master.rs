@@ -78,7 +78,15 @@ impl MasterClient {
             bail!("{url} ответил {}", response.status());
         }
 
-        let mut file = tokio::fs::File::create(&tmp).await?;
+        // Каталог — чаще всего папка сервера, а её меняет процесс сервера:
+        // на месте предсказуемого `*.noro-part` могла лежать ссылка на файл
+        // хоста, и скачанное легло бы туда. Создаём эксклюзивно.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
         let mut sha1_hasher = sha1::Sha1::new();
         let mut sha256_hasher = sha2::Sha256::new();
         let mut size = 0u64;

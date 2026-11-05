@@ -62,6 +62,8 @@ pub struct Daemon {
     pub placeholders: Arc<dashmap::DashMap<Uuid, server::waker::Placeholder>>,
     /// Ограничитель побудок: стучать в порт спящего сервера может кто угодно.
     pub wake_gate: server::wake_gate::WakeGate,
+    /// Какие серверы заняты тяжёлой операцией.
+    pub busy: server::busy::Busy,
 }
 
 impl Daemon {
@@ -113,6 +115,7 @@ async fn main() -> Result<()> {
         quota: fs::quota::Quota::default(),
         placeholders: Arc::new(dashmap::DashMap::new()),
         wake_gate: server::wake_gate::WakeGate::default(),
+        busy: server::busy::Busy::default(),
     };
 
     // Переподключиться к тому, что уже работает, до первого кадра мастеру:

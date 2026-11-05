@@ -1,6 +1,7 @@
 //! Игровой сервер на ноде: каталог, установка, присмотр.
 
 pub mod agent;
+pub mod busy;
 pub mod clone;
 pub mod install;
 pub mod layout;

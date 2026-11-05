@@ -16,6 +16,36 @@ use crate::Daemon;
 pub type OpResult = std::result::Result<Value, OpError>;
 
 pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
+    let _busy = match heavy(&op) {
+        Some((server, what)) => Some(daemon.busy.try_take(server, what).map_err(|running| {
+            OpError::new(
+                "server_busy",
+                format!("на сервере уже идёт другая операция: {running}"),
+            )
+        })?),
+        None => None,
+    };
+    run(daemon, op).await
+}
+
+/// Операции, которые меняют сервер целиком и не должны идти вперемешку.
+fn heavy(op: &NodeOp) -> Option<(Uuid, &'static str)> {
+    let (server, what) = match op {
+        NodeOp::ServerCreate { server, .. } => (server, "создание"),
+        NodeOp::ServerUpdate { server, .. } => (server, "пересборка"),
+        NodeOp::ServerDelete { server, .. } => (server, "удаление"),
+        NodeOp::Install { server, .. } => (server, "установка"),
+        NodeOp::ServerPackApply { server, .. } => (server, "установка пака"),
+        NodeOp::BuildSync { server, .. } => (server, "синхронизация сборки"),
+        NodeOp::BackupCreate { server, .. } => (server, "бэкап"),
+        NodeOp::BackupRestore { server, .. } => (server, "восстановление"),
+        NodeOp::ServerCloneFiles { server, .. } => (server, "клонирование"),
+        _ => return None,
+    };
+    Some((*server, what))
+}
+
+async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
     match op {
         NodeOp::NodeInfo => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
 

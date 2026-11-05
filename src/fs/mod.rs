@@ -6,6 +6,7 @@ pub mod list;
 pub mod nofollow;
 pub mod quota;
 pub mod safe;
+pub mod sweep;
 
 pub use safe::{is_hidden, resolve, resolve_entry, resolve_existing};
 

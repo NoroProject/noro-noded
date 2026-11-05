@@ -1,3 +1,4 @@
+// Файл превышает 150 строк: сборка демона и его фоновые задачи (замеры, уборка, переподключение) — одна точка старта.
 //! `noro-noded` — демон ноды.
 //!
 //! Держит игровые серверы в контейнерах и ходит к мастеру исходящим
@@ -130,6 +131,7 @@ async fn main() -> Result<()> {
     // демона, а канал с мастером ниже занимает основной поток.
     tokio::spawn(http::serve(daemon.clone()));
     spawn_node_stats(daemon.clone(), events_tx.clone());
+    spawn_sweep(&daemon);
     spawn_server_stats(daemon.clone(), events_tx);
 
     link::session::run(daemon, events_rx).await
@@ -168,6 +170,26 @@ fn spawn_server_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
                     // это не повод шуметь в лог на каждом тике.
                     Err(e) => tracing::debug!(%server, error = %e, "замер не удался"),
                 }
+            }
+        }
+    });
+}
+
+/// Убрать временные файлы оборванных до рестарта операций — в фоне, по
+/// одному серверу: это обход каталогов, и старт демона он ждать не должен.
+fn spawn_sweep(daemon: &Daemon) {
+    let servers = daemon.cfg.data_dir.join("servers");
+    tokio::task::spawn_blocking(move || {
+        let Ok(dirs) = std::fs::read_dir(&servers) else {
+            return;
+        };
+        for dir in dirs.flatten() {
+            if !dir.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let removed = fs::sweep::sweep(&dir.path(), fs::sweep::MIN_AGE);
+            if removed > 0 {
+                tracing::info!(server = %dir.file_name().to_string_lossy(), removed, "убраны недописанные временные файлы");
             }
         }
     });

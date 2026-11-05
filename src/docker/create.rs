@@ -52,7 +52,7 @@ impl Engine {
             );
         }
 
-        let body = ContainerCreateBody {
+        let mut body = ContainerCreateBody {
             image: Some(args.spec.image.clone()),
             user: Some(format!("{CONTAINER_UID}:{CONTAINER_GID}")),
             working_dir: Some(CONTAINER_ROOT.to_string()),
@@ -75,9 +75,36 @@ impl Engine {
             ..Default::default()
         };
 
+        if let Some(hc) = body.host_config.as_mut() {
+            hc.log_config = self.rotated_log().await;
+        }
+
         let created = self.docker.create_container(Some(options), body).await?;
         Ok(created.id)
     }
+
+    /// Ротация лога контейнера, если докер пишет его в json-файл.
+    ///
+    /// Умолчание докера — json-file без предела: лог болтливого сервера рос
+    /// неделями и съедал диск ноды целиком, хотя ни демону, ни панели он не
+    /// нужен — консоль идёт через attach. Другой драйвер (journald, loki)
+    /// выбрал оператор, и спорить с ним незачем.
+    async fn rotated_log(&self) -> Option<bollard::models::HostConfigLogConfig> {
+        let driver = self.docker.info().await.ok()?.logging_driver;
+        rotated_log_for(driver.as_deref())
+    }
+}
+
+pub(crate) fn rotated_log_for(
+    driver: Option<&str>,
+) -> Option<bollard::models::HostConfigLogConfig> {
+    (driver == Some("json-file")).then(|| bollard::models::HostConfigLogConfig {
+        typ: Some("json-file".into()),
+        config: Some(HashMap::from([
+            ("max-size".to_string(), "20m".to_string()),
+            ("max-file".to_string(), "3".to_string()),
+        ])),
+    })
 }
 
 /// Без jar это не Java-сервер, а образ со своей точкой входа (лимбо на Pumpkin,

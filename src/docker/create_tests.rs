@@ -247,3 +247,12 @@ fn the_container_cannot_gain_privileges() {
     assert!(hc.cap_add.is_none());
     assert!(hc.privileged.is_none());
 }
+
+#[test]
+fn the_default_json_log_is_rotated_and_other_drivers_are_left_alone() {
+    let rotated = rotated_log_for(Some("json-file")).expect("json-file is rotated");
+    let config = rotated.config.unwrap();
+    assert_eq!(config.get("max-size").map(String::as_str), Some("20m"));
+    assert!(rotated_log_for(Some("journald")).is_none());
+    assert!(rotated_log_for(None).is_none());
+}

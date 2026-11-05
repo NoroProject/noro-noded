@@ -111,7 +111,9 @@ fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let file = std::fs::File::create(dest).context("не создать файл архива")?;
+    // Каталог бэкапов лежит внутри папки сервера, а её меняет процесс сервера:
+    // на месте архива могла оказаться ссылка на файл хоста.
+    let file = crate::fs::nofollow::create_replacing(dest).context("не создать файл архива")?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = tar::Builder::new(encoder);
     // По умолчанию tar идёт по ссылкам и кладёт в архив то, на что они ведут.

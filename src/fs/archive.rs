@@ -121,7 +121,7 @@ pub fn pack(root: &Path, paths: &[String], dest: &str) -> Result<u64> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut zip = zip::ZipWriter::new(BufWriter::new(File::create(&archive)?));
+    let mut zip = zip::ZipWriter::new(BufWriter::new(super::nofollow::create_replacing(&archive)?));
     let options: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut count = 0u64;

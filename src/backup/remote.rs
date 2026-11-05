@@ -83,7 +83,11 @@ pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
     if let Some(parent) = archive.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(archive, bytes).await?;
+    // Мимо ссылок: каталог бэкапов внутри папки сервера.
+    let archive = archive.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::fs::nofollow::write(&archive, &bytes))
+        .await
+        .map_err(|e| anyhow::anyhow!("запись архива не выполнена: {e}"))??;
     Ok(())
 }
 

@@ -179,18 +179,20 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         self.room_for_handle(&path)?;
         let dir = self.resolve(&path)?;
-        let listing = std::fs::read_dir(&dir).map_err(|_| StatusCode::NoSuchFile)?;
-
-        let mut files = Vec::new();
-        for entry in listing.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child = format!("{}/{name}", path.trim_end_matches('/'));
-            if crate::fs::is_hidden(child.trim_start_matches('/')) {
-                continue;
+        let files = blocking(|| {
+            let listing = std::fs::read_dir(&dir).map_err(|_| StatusCode::NoSuchFile)?;
+            let mut files = Vec::new();
+            for entry in listing.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let child = format!("{}/{name}", path.trim_end_matches('/'));
+                if crate::fs::is_hidden(child.trim_start_matches('/')) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                files.push(File::new(&name, attrs_of(&meta)));
             }
-            let Ok(meta) = entry.metadata() else { continue };
-            files.push(File::new(&name, attrs_of(&meta)));
-        }
+            Ok(files)
+        })?;
 
         self.dirs.insert(path.clone(), files);
         Ok(Handle { id, handle: path })
@@ -329,7 +331,7 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<Status, Self::Error> {
         self.require_write()?;
         let dir = self.resolve(&path)?;
-        std::fs::create_dir_all(dir).map_err(|_| StatusCode::Failure)?;
+        blocking(|| std::fs::create_dir_all(dir).map_err(|_| StatusCode::Failure))?;
         self.report(SftpActionKind::Mkdir, &path);
         Ok(Self::ok(id))
     }
@@ -340,7 +342,7 @@ impl russh_sftp::server::Handler for SftpSession {
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
             return Err(StatusCode::Failure);
         }
-        crate::fs::nofollow::remove(&path).map_err(|_| StatusCode::Failure)?;
+        blocking(|| crate::fs::nofollow::remove(&path).map_err(|_| StatusCode::Failure))?;
         self.report(SftpActionKind::Delete, &filename);
         Ok(Self::ok(id))
     }
@@ -348,7 +350,7 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
         let dir = self.resolve_entry(&path)?;
-        crate::fs::nofollow::remove(&dir).map_err(|_| StatusCode::Failure)?;
+        blocking(|| crate::fs::nofollow::remove(&dir).map_err(|_| StatusCode::Failure))?;
         self.report(SftpActionKind::Delete, &path);
         Ok(Self::ok(id))
     }
@@ -362,7 +364,7 @@ impl russh_sftp::server::Handler for SftpSession {
         self.require_write()?;
         let from = self.resolve_entry(&oldpath)?;
         let to = self.resolve_entry(&newpath)?;
-        crate::fs::nofollow::rename(&from, &to).map_err(|_| StatusCode::Failure)?;
+        blocking(|| crate::fs::nofollow::rename(&from, &to).map_err(|_| StatusCode::Failure))?;
         self.report(SftpActionKind::Rename, &newpath);
         Ok(Self::ok(id))
     }
@@ -381,73 +383,18 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 }
 
-/// Идентификатор сервера из логина `игрок.адрес`.
-pub fn split_login(login: &str) -> Option<(&str, &str)> {
-    let (user, slug) = login.rsplit_once('.')?;
-    if user.is_empty() || slug.is_empty() {
-        return None;
+/// Удаление мира или листинг на десятки тысяч файлов шли прямо на рабочем
+/// потоке рантайма и останавливали консоли всей ноды. `block_in_place` отдаёт
+/// остальные задачи другим потокам, не вынося состояние сессии в задачу.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
     }
-    Some((user, slug))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_login_names_the_player_and_the_server() {
-        assert_eq!(split_login("alice.survival"), Some(("alice", "survival")));
-        // Ник с точкой тоже бывает: сервер — то, что после **последней** точки.
-        assert_eq!(split_login("a.b.test-town"), Some(("a.b", "test-town")));
-        assert_eq!(split_login("alice"), None);
-        assert_eq!(split_login(".survival"), None);
-        assert_eq!(split_login("alice."), None);
-    }
-
-    /// Уникальный идентификатор сессии не участвует в путях — проверка, что
-    /// корень действительно приходит снаружи, а не собирается из логина.
-    #[test]
-    fn the_session_root_is_whatever_the_master_said() {
-        let grant = SftpGrant {
-            user_id: uuid::Uuid::nil(),
-            panel_server_id: uuid::Uuid::nil(),
-            can_write: false,
-            can_delete: false,
-        };
-        let (tx, _rx) = mpsc::channel(1);
-        let session = SftpSession::new(
-            PathBuf::from("/srv/x"),
-            grant,
-            tx,
-            crate::fs::quota::Quota::default(),
-        );
-        assert_eq!(session.root, PathBuf::from("/srv/x"));
-        assert!(session.require_write().is_err(), "без права записи — отказ");
-        assert!(session.require_delete().is_err());
-    }
-
-    #[test]
-    fn open_handles_are_capped() {
-        let grant = SftpGrant {
-            user_id: uuid::Uuid::nil(),
-            panel_server_id: uuid::Uuid::nil(),
-            can_write: false,
-            can_delete: false,
-        };
-        let (tx, _rx) = mpsc::channel(1);
-        let mut session = SftpSession::new(
-            PathBuf::from("/srv/x"),
-            grant,
-            tx,
-            crate::fs::quota::Quota::default(),
-        );
-        for n in 0..MAX_HANDLES {
-            session.dirs.insert(format!("/d{n}"), Vec::new());
-        }
-        assert!(session.room_for_handle("/another").is_err());
-        assert!(
-            session.room_for_handle("/d0").is_ok(),
-            "повторное открытие той же ручки не занимает места"
-        );
-    }
-}
+#[path = "handler_tests.rs"]
+mod tests;

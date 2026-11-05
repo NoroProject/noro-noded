@@ -21,6 +21,15 @@ struct AuthRequest<'a> {
     password: Option<&'a str>,
 }
 
+/// Идентификатор сервера из логина `игрок.адрес`.
+pub fn split_login(login: &str) -> Option<(&str, &str)> {
+    let (user, slug) = login.rsplit_once('.')?;
+    if user.is_empty() || slug.is_empty() {
+        return None;
+    }
+    Some((user, slug))
+}
+
 /// Что мастер разрешил этой сессии.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SftpGrant {

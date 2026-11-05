@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
-use super::auth::{authorize, SftpGrant};
-use super::handler::{split_login, SftpSession};
+use super::auth::{authorize, split_login, SftpGrant};
+use super::handler::SftpSession;
 use crate::link::master::MasterClient;
 
 /// Пауза после неудачной попытки. Подбор пароля становится бессмысленным, а

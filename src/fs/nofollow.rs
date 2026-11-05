@@ -73,6 +73,11 @@ impl Dir {
         self.base().join(name.as_ref())
     }
 
+    /// Содержимое каталога — того самого, что сверен при открытии.
+    pub fn read_dir(&self) -> std::io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(self.base())
+    }
+
     #[cfg(unix)]
     fn base(&self) -> PathBuf {
         use std::os::fd::AsRawFd;

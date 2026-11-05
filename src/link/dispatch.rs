@@ -237,9 +237,8 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
 
             fs::io::write_text(&root, &path, &content)
-                .map(|_| {
-                    let p = root.join(&path);
-                    if let Err(e) = crate::server::layout::chown_path(&p) {
+                .map(|written| {
+                    if let Err(e) = crate::server::layout::chown_path(&written) {
                         tracing::warn!(server = %server, error = %e, "config file owner not corrected");
                     }
                     daemon.quota.add(server, content.len() as u64);

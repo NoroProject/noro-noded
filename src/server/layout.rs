@@ -1,3 +1,4 @@
+// Файл превышает 150 строк: каталог сервера и смена его владельца — одно правило о том, что принадлежит контейнеру.
 //! Каталог сервера на диске.
 
 use anyhow::Result;
@@ -74,19 +75,53 @@ impl Layout {
 /// `x -> /var/run/docker.sock` в нём — обычное дело для злоумышленника. `chown`
 /// пошёл бы по ней и отдал файл хоста uid контейнера, а на многих машинах этот
 /// uid — первый пользователь хоста, то есть сокет докера и с ним root.
+///
+/// Одного `lchown` мало: обход идёт секундами, часто по живому серверу, и
+/// каталог посреди пути успевали подменить ссылкой — `lchown` по пути
+/// `plugins/x/passwd` уходил в `/etc/passwd`. Поэтому каждый каталог
+/// открывается и сверяется (`nofollow::Dir`), а владелец меняется у записей
+/// внутри него, а не по пути от корня.
 #[cfg(unix)]
 pub fn chown_recursive(path: &Path) -> Result<()> {
     use crate::docker::engine::{CONTAINER_GID, CONTAINER_UID};
     use std::os::unix::fs::lchown;
 
     lchown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
-    for entry in walkdir::WalkDir::new(path).follow_links(false) {
-        let entry = entry?;
-        // Ошибку на одном файле не превращаем в отказ целиком: каталог мог
-        // измениться прямо во время обхода, и это нормально.
-        let _ = lchown(entry.path(), Some(CONTAINER_UID), Some(CONTAINER_GID));
-    }
+    let dir = crate::fs::nofollow::Dir::open(path)?;
+    chown_tree(&dir, path, 0);
     Ok(())
+}
+
+/// Глубже этого каталоги серверу не нужны, а без потолка рекурсия по нарочно
+/// вложенным папкам роняла бы демон переполнением стека.
+#[cfg(unix)]
+const MAX_DEPTH: usize = 128;
+
+#[cfg(unix)]
+fn chown_tree(dir: &crate::fs::nofollow::Dir, path: &Path, depth: usize) {
+    use crate::docker::engine::{CONTAINER_GID, CONTAINER_UID};
+    use std::os::unix::fs::{lchown, MetadataExt};
+
+    // Ошибку на одной записи не превращаем в отказ целиком: каталог мог
+    // измениться прямо во время обхода, и это нормально.
+    let Ok(entries) = dir.read_dir() else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(meta) = entry.metadata() else { continue };
+        // Файл с несколькими именами мог получить второе имя вне сервера —
+        // так выглядит жёсткая ссылка на файл хоста. Своему файлу сервера
+        // смена владельца не нужна: его и создал процесс сервера.
+        if !meta.is_dir() && meta.nlink() > 1 {
+            continue;
+        }
+        let _ = lchown(dir.entry(&name), Some(CONTAINER_UID), Some(CONTAINER_GID));
+        if meta.is_dir() && depth < MAX_DEPTH {
+            let child = path.join(&name);
+            if let Ok(sub) = crate::fs::nofollow::Dir::open(&child) {
+                chown_tree(&sub, &child, depth + 1);
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -101,9 +136,14 @@ pub fn chown_path(path: &Path) -> Result<()> {
     use crate::docker::engine::{CONTAINER_GID, CONTAINER_UID};
     use std::os::unix::fs::lchown;
 
-    // `lchown` по той же причине, что и в `chown_recursive`: между записью
-    // файла и сменой владельца на его место могли подложить ссылку.
-    lchown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
+    // `lchown` в сверенном каталоге по той же причине, что и в
+    // `chown_recursive`: между записью файла и сменой владельца на его место
+    // или на место каталога над ним могли подложить ссылку.
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        anyhow::bail!("у пути нет имени файла");
+    };
+    let dir = crate::fs::nofollow::Dir::open(parent)?;
+    lchown(dir.entry(name), Some(CONTAINER_UID), Some(CONTAINER_GID))?;
     Ok(())
 }
 

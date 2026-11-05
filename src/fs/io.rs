@@ -57,7 +57,9 @@ pub fn read_text(root: &Path, rel: &str, max_bytes: u64) -> Result<FileContent> 
 ///
 /// Пишем во временный файл рядом и переименовываем: прерванная запись иначе
 /// оставляет обрезанный `server.properties`, с которым сервер не стартует.
-pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<()> {
+/// Возвращает путь, куда файл лёг на самом деле, — им и надо пользоваться
+/// дальше, а не склейкой корня с запрошенной строкой.
+pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<std::path::PathBuf> {
     guard_hidden(rel)?;
     let path = super::resolve(root, rel)?;
     if let Some(parent) = path.parent() {
@@ -72,7 +74,8 @@ pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<()> {
     // Временный файл — со случайным именем и эксклюзивно: предсказуемое имя
     // рядом с целью процесс сервера занимал ссылкой на файл хоста, и правка из
     // панели записывала туда.
-    super::nofollow::write(&path, content.as_bytes())
+    super::nofollow::write(&path, content.as_bytes())?;
+    Ok(path)
 }
 
 pub fn mkdir(root: &Path, rel: &str) -> Result<()> {

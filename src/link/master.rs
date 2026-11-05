@@ -20,8 +20,15 @@ pub struct MasterClient {
 
 impl MasterClient {
     pub fn new(base: &str, token: &str) -> Result<Self> {
+        // Общего потолка нет — ядро или пак качаются минутами, и угадать
+        // разумный срок для любого размера нельзя. Зато нет и бесконечного
+        // ожидания: соединение, которое не устанавливается или замолчало
+        // посреди ответа, обрывается. Без этого зависшая раздача держала
+        // установку, синк сборки и вход по SFTP, пока демон не перезапустят.
         let http = reqwest::Client::builder()
             .user_agent(concat!("noro-noded/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()?;
         Ok(Self {
             http,

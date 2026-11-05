@@ -324,10 +324,30 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             dest,
         } => {
             let root = daemon.cfg.server_dir(server);
-            blocking(move || fs::archive::pack(&root, &paths, &dest))
+            // Архив — копия своих источников, сжатая или нет: без проверки
+            // «упаковать world» обходил квоту так же, как копирование.
+            let (src_root, sources) = (root.clone(), paths.clone());
+            let size = blocking(move || {
+                Ok(sources
+                    .iter()
+                    .filter_map(|p| fs::resolve_existing(&src_root, p).ok())
+                    .map(|p| fs::quota::dir_size(&p))
+                    .sum::<u64>())
+            })
+            .await
+            .unwrap_or(0);
+            daemon
+                .quota
+                .check(server, &root, size)
+                .await
+                .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
+            let measured = root.clone();
+            let result = blocking(move || fs::archive::pack(&root, &paths, &dest))
                 .await
                 .map(|count| json!({ "count": count }))
-                .map_err(fs_error)
+                .map_err(fs_error);
+            daemon.quota.measure(server, &measured).await;
+            result
         }
 
         NodeOp::FsUnarchive {
@@ -336,10 +356,23 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             dest_dir,
         } => {
             let root = daemon.cfg.server_dir(server);
-            blocking(move || fs::archive::unpack(&root, &path, &dest_dir))
-                .await
-                .map(|count| json!({ "count": count }))
-                .map_err(fs_error)
+            let usage = daemon.quota.usage(server, &root).await;
+            let budget =
+                (usage.limit_bytes > 0).then(|| usage.limit_bytes.saturating_sub(usage.used_bytes));
+            let measured = root.clone();
+            let result =
+                blocking(move || fs::archive::unpack_within(&root, &path, &dest_dir, budget))
+                    .await
+                    .map(|count| json!({ "count": count }))
+                    .map_err(|e| {
+                        if e.to_string().contains("квоту") {
+                            OpError::new("panel_disk_full", e.to_string())
+                        } else {
+                            fs_error(e)
+                        }
+                    });
+            daemon.quota.measure(server, &measured).await;
+            result
         }
 
         NodeOp::SleepPlaceholder {

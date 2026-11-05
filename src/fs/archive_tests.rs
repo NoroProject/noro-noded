@@ -1,6 +1,7 @@
 //! Проверки распаковки: главное здесь — куда записи НЕ ложатся.
 
 use super::*;
+use std::fs::File;
 use std::io::Write;
 
 struct Sandbox {
@@ -125,4 +126,38 @@ fn packing_gathers_files_and_skips_the_service_directory() {
 
     assert_eq!(count, 1, "только mods/a.jar");
     assert!(s.root.join("backup.zip").exists());
+}
+
+/// Распаковка не выходит за остаток квоты, и недописанная запись убирается.
+#[test]
+fn unpacking_stops_at_the_budget() {
+    let s = Sandbox::new();
+    let big = "x".repeat(4096);
+    s.write_zip("bomb.zip", &[("a.bin", "small"), ("b.bin", big.as_str())]);
+
+    assert!(unpack_within(&s.root, "bomb.zip", "out", Some(1024)).is_err());
+    assert!(s.root.join("out/a.bin").exists());
+    assert!(!s.root.join("out/b.bin").exists(), "недописанное убрано");
+
+    assert_eq!(
+        unpack_within(&s.root, "bomb.zip", "ok", Some(8192)).unwrap(),
+        2
+    );
+}
+
+/// Архив внутри упаковываемого каталога не упаковывает сам себя.
+#[test]
+fn an_archive_does_not_swallow_itself() {
+    let s = Sandbox::new();
+    std::fs::create_dir_all(s.root.join("world")).unwrap();
+    std::fs::write(s.root.join("world/level.dat"), "lvl").unwrap();
+
+    assert_eq!(
+        pack(&s.root, &["world".into()], "world/world.zip").unwrap(),
+        1
+    );
+    let file = File::open(s.root.join("world/world.zip")).unwrap();
+    let zip = zip::ZipArchive::new(file).unwrap();
+    assert_eq!(zip.len(), 1);
+    assert_eq!(zip.name_for_index(0), Some("world/level.dat"));
 }

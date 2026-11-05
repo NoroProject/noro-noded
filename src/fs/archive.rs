@@ -7,8 +7,7 @@
 //! всё остальное, а служебный `.noro/` не читается и не перезаписывается.
 
 use anyhow::{bail, Context, Result};
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// `.zip` или `.tar.gz` — по расширению имени.
@@ -35,16 +34,55 @@ fn entry_target(root: &Path, dest_dir: &str, name: &str) -> Option<PathBuf> {
 /// дурным именем не повод отказать в остальных трёхстах файлах, но и класть
 /// такую запись нельзя.
 pub fn unpack(root: &Path, path: &str, dest_dir: &str) -> Result<u64> {
+    unpack_within(root, path, dest_dir, None)
+}
+
+/// То же, но не больше `budget` байт распакованного.
+///
+/// Размер внутри архива ничем не ограничен: zip в мегабайт разворачивается в
+/// десятки гигабайт, и распаковка обходила квоту сервера и забивала диск
+/// всей ноде. Потолок — остаток квоты; запись, на которой он кончился,
+/// убирается, и распаковка останавливается.
+pub fn unpack_within(root: &Path, path: &str, dest_dir: &str, budget: Option<u64>) -> Result<u64> {
     let archive = super::resolve_existing(root, path)?;
+    let mut sink = Sink { budget, spent: 0 };
     if is_zip(path) {
-        unpack_zip(root, &archive, dest_dir)
+        unpack_zip(root, &archive, dest_dir, &mut sink)
     } else {
-        unpack_tar(root, &archive, dest_dir)
+        unpack_tar(root, &archive, dest_dir, &mut sink)
     }
 }
 
-fn unpack_zip(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
-    let file = File::open(archive).context("не открыть архив")?;
+/// Сколько уже распаковано и сколько ещё можно.
+struct Sink {
+    budget: Option<u64>,
+    spent: u64,
+}
+
+impl Sink {
+    fn write(&mut self, target: &Path, reader: &mut dyn Read) -> Result<()> {
+        let mut out = BufWriter::new(super::nofollow::create_replacing(target)?);
+        let copied = match self.budget {
+            Some(budget) => {
+                let room = budget.saturating_sub(self.spent);
+                let copied = std::io::copy(&mut reader.take(room.saturating_add(1)), &mut out)?;
+                if copied > room {
+                    drop(out);
+                    let _ = super::nofollow::remove(target);
+                    bail!("распакованное не помещается в квоту сервера");
+                }
+                copied
+            }
+            None => std::io::copy(reader, &mut out)?,
+        };
+        out.flush()?;
+        self.spent += copied;
+        Ok(())
+    }
+}
+
+fn unpack_zip(root: &Path, archive: &Path, dest_dir: &str, sink: &mut Sink) -> Result<u64> {
+    let file = super::nofollow::open_existing(archive, false).context("не открыть архив")?;
     let mut zip = zip::ZipArchive::new(BufReader::new(file)).context("не разобрать zip")?;
     let mut written = 0u64;
 
@@ -68,16 +106,15 @@ fn unpack_zip(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = BufWriter::new(super::nofollow::create_replacing(&target)?);
-        std::io::copy(&mut entry, &mut out)?;
+        sink.write(&target, &mut entry)?;
         written += 1;
     }
 
     Ok(written)
 }
 
-fn unpack_tar(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
-    let file = File::open(archive).context("не открыть архив")?;
+fn unpack_tar(root: &Path, archive: &Path, dest_dir: &str, sink: &mut Sink) -> Result<u64> {
+    let file = super::nofollow::open_existing(archive, false).context("не открыть архив")?;
     let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
     let mut tar = tar::Archive::new(decoder);
     let mut written = 0u64;
@@ -103,8 +140,7 @@ fn unpack_tar(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = BufWriter::new(super::nofollow::create_replacing(&target)?);
-        std::io::copy(&mut entry, &mut out)?;
+        sink.write(&target, &mut entry)?;
         written += 1;
     }
 
@@ -117,6 +153,11 @@ pub fn pack(root: &Path, paths: &[String], dest: &str) -> Result<u64> {
         bail!("служебный каталог не трогается");
     }
     let archive = super::resolve(root, dest)?;
+    // Имена в архиве — от настоящего корня: пути источников канонические, и
+    // от неканонического корня они не отрезались, а целиком уходили в архив
+    // путём хоста.
+    let root = root.canonicalize()?;
+    let root = root.as_path();
     if let Some(parent) = archive.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -137,6 +178,10 @@ pub fn pack(root: &Path, paths: &[String], dest: &str) -> Result<u64> {
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file())
+                // Архив, который ложится внутрь упаковываемого каталога,
+                // попадал в обход сам: читался, пока в него же писался, и рос,
+                // пока не кончится диск.
+                .filter(|e| e.path() != archive)
             {
                 let inner = entry
                     .path()

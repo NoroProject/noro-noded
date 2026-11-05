@@ -170,7 +170,7 @@ fn send(replies: &mpsc::UnboundedSender<String>, frame: &FromNode) {
 async fn hello(daemon: &Daemon) -> Result<FromNode> {
     let docker_version = daemon.engine.version().await.unwrap_or_default();
     let servers = daemon.engine.snapshot().await.unwrap_or_default();
-    let machine = crate::metrics::machine();
+    let machine = crate::metrics::machine(&daemon.cfg.data_dir);
 
     let mut capabilities = vec![caps::IMAGE_PULL.to_string()];
     if daemon.cfg.http.public_url.is_some() {

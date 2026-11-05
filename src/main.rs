@@ -227,6 +227,7 @@ async fn start_sftp(daemon: &Daemon) {
 fn spawn_node_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut sampler = metrics::Sampler::new();
         loop {
             ticker.tick().await;
             let running = daemon
@@ -243,7 +244,7 @@ fn spawn_node_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
                 .count() as u32;
             let _ = events
                 .send(NodeEvent::NodeStats {
-                    stats: metrics::sample(running),
+                    stats: sampler.sample(running, &daemon.cfg.data_dir),
                 })
                 .await;
         }

@@ -103,6 +103,10 @@ hang off those names:
 - `NORO-IN`, jumped to first from `INPUT` for `nr-+`, refuses everything the
   host itself listens on.
 
+The master's own address and port (from `master_url`) are always let
+through: the game agent and authlib-injector talk to it, and on a
+single-machine install that address is the host itself.
+
 The daemon re-applies them every minute and at start, before anything else,
 so a reboot or `ufw reload` does not leave a gap. It needs `iptables` and
 `iptables-restore` on the host and the host's network namespace — the

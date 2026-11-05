@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod busy;
 pub mod clone;
+pub mod entry;
 pub mod install;
 pub mod layout;
 pub mod pack;

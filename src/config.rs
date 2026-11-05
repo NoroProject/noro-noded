@@ -37,6 +37,8 @@ pub struct Config {
     pub project_quota: bool,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub backups: BackupsConfig,
 }
 
 /// Изоляция сети серверов — см. `net/rules.rs`.
@@ -53,6 +55,25 @@ pub struct NetworkConfig {
     /// Что серверам всё же можно: `10.0.0.5`, `10.0.0.0/24`, `10.0.0.5:3306`.
     #[serde(default)]
     pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupsConfig {
+    /// Снимать бэкапы снимками в хранилище кусков. `false` возвращает полные
+    /// `.tar.gz` — путь отката, если с хранилищем что-то не так; уже снятые
+    /// снимки при этом восстанавливаются и скачиваются как прежде.
+    #[serde(default = "default_true")]
+    pub incremental: bool,
+}
+
+impl Default for BackupsConfig {
+    fn default() -> Self {
+        Self { incremental: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,6 +246,7 @@ mod tests {
             disk_reserve_mb: default_disk_reserve_mb(),
             project_quota: true,
             network: NetworkConfig::default(),
+            backups: BackupsConfig::default(),
         }
     }
 

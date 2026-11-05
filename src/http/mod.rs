@@ -118,7 +118,16 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
     // сервера мог положить на его место или на место каталога над ним ссылку
     // на файл хоста. Поэтому он разрешается заново, и открывается без ссылок.
     let root = daemon.cfg.server_dir(ticket.server);
-    let path = match ticket.path(&root, &daemon.cfg.backup_dir(ticket.server)) {
+    let backups = daemon.cfg.backup_dir(ticket.server);
+    if let tickets::Target::Backup(backup) = ticket.target {
+        if matches!(
+            crate::backup::store::find(&backups, backup),
+            crate::backup::store::Kept::Snapshot
+        ) {
+            return snapshot_download(backups, backup, &ticket.filename);
+        }
+    }
+    let path = match ticket.path(&root, &backups) {
         Ok(p) => p,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
@@ -140,6 +149,24 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{}\"", safe_name(&ticket.filename)),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Снимок отдаётся tar.gz, собранным на лету. Длины заранее не знает никто,
+/// поэтому ответ идёт без `Content-Length`: браузер покажет скачивание без
+/// процентов, зато на диске ноды не появится второй копии мира.
+fn snapshot_download(backups: std::path::PathBuf, backup: uuid::Uuid, filename: &str) -> Response {
+    let body = Body::from_stream(crate::backup::stream::tar_gz_stream(backups, backup));
+    (
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", safe_name(filename)),
             ),
         ],
         body,

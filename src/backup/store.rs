@@ -110,21 +110,41 @@ fn backup_of(name: &str) -> Option<Uuid> {
         .and_then(|id| Uuid::parse_str(id).ok())
 }
 
-/// Сколько байт занимают архивы сервера. Ссылки и прочее не считаются: их
-/// здесь быть не должно, а прочитать по ним всё равно ничего не дадут.
+/// Сколько байт занимают бэкапы сервера: архивы, куски и манифесты — то, что
+/// реально лежит на диске. С дедупликацией сумма размеров бэкапов говорит о
+/// месте не больше, чем сумма размеров миров. Ссылки и прочее не считаются:
+/// их здесь быть не должно, а прочитать по ним всё равно ничего не дадут.
 pub fn usage(dir: &Path) -> u64 {
-    let Ok(dir) = nofollow::Dir::open(dir) else {
+    if nofollow::Dir::open(dir).is_err() {
         return 0;
-    };
-    let Ok(entries) = dir.read_dir() else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter_map(|e| std::fs::symlink_metadata(dir.entry(e.file_name())).ok())
-        .filter(|m| m.file_type().is_file())
+    }
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()
+}
+
+/// В каком виде бэкап лежит на ноде.
+pub enum Kept {
+    Archive(PathBuf),
+    Snapshot,
+    Missing,
+}
+
+pub fn find(dir: &Path, backup: Uuid) -> Kept {
+    let archive = archive_path(dir, backup);
+    if std::fs::symlink_metadata(&archive).is_ok_and(|m| m.is_file()) {
+        return Kept::Archive(archive);
+    }
+    if super::repo::Repo::at(dir).has_snapshot(backup) {
+        return Kept::Snapshot;
+    }
+    Kept::Missing
 }
 
 #[cfg(all(test, unix))]

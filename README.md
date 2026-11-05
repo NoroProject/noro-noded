@@ -29,11 +29,29 @@ build rollout, backups, schedules and SFTP all travel over that one socket.
 - **Build rollout.** Downloads the server side of a modpack by sha1 and removes
   stale files **only inside managed roots** — `world/`, `logs/` and the rest are
   never in scope.
-- **Backups.** `save-off` → `save-all flush` → tar → `save-on`: a tar of a live
-  world gives broken regions. Archives live in `<data_dir>/backups/<server>/`,
+- **Backups.** `save-off` → `save-all flush` → snapshot → `save-on`: a copy of a
+  live world gives broken regions. Backups live in `<data_dir>/backups/<server>/`,
   outside the directory mounted into the container, so a plugin cannot delete or
   swap a restore point. They have their own limit, set by the master, apart from
-  the server's disk quota.
+  the server's disk quota; the limit counts what is really on disk.
+  - **Incremental by default.** Files are cut into content-defined chunks
+    (FastCDC, 256 KiB–4 MiB, ~1 MiB average), each stored once under its blake3
+    hash and compressed with zstd (`chunks/`); a snapshot is a manifest of files
+    and their chunks (`snapshots/<id>.snap`). A world that changed by a few
+    percent adds a few percent. Files whose size and ctime did not move since
+    the previous snapshot are not even read.
+  - **Crash-safe.** The manifest is written last, after the chunks are synced,
+    so a snapshot either exists whole or not at all. Deleting a snapshot
+    removes its manifest and then sweeps every chunk no manifest refers to
+    (mark-and-sweep, no reference counts to go stale); an unreadable manifest
+    stops the sweep instead of guessing.
+  - **Restore** is full or of a single file or directory, writes only regular
+    files and directories, and never leaves the server directory. Downloads and
+    uploads to S3 are a plain `.tar.gz` assembled on the fly — no temporary copy
+    of the world on disk; S3 gets it as a streamed multipart upload.
+  - **Rollback:** `[backups] incremental = false` in `noded.toml` returns to full
+    `.tar.gz` archives. Snapshots already taken still restore and download, and
+    old archives keep working either way.
 - **Crash fingerprints.** When a server crashes or is killed for memory, the
   last 200 console lines and that run's `crash-reports/*.txt` are kept in
   `<data_dir>/crashes/<server>/` (the last five), before the automatic restart

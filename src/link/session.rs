@@ -211,6 +211,7 @@ async fn hello(daemon: &Daemon) -> Result<FromNode> {
     let mut capabilities = vec![
         caps::IMAGE_PULL.to_string(),
         caps::SERVER_LIMITS.to_string(),
+        caps::BACKUP_PARTIAL.to_string(),
     ];
     if daemon.cfg.network.isolation {
         capabilities.push(caps::NET_ISOLATION.to_string());

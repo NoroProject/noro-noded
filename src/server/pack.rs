@@ -137,6 +137,12 @@ pub fn apply(root: &Path, staging: &Path) -> Result<bool> {
 /// Разложить файлы папки содержимого поверх того, что есть, запомнив каждый.
 /// Чужие файлы рядом — агент, моды из панели, их конфиги — не трогаются.
 fn place(from: &Path, to: &Path, rel: &Path, owned: &mut BTreeSet<String>) -> Result<()> {
+    // Ссылка на месте папки пака — дорога наружу, которую положил процесс
+    // сервера: `mods -> /etc` превращал раскладку в запись файлов хоста от
+    // root. Папка принадлежит паку, поэтому ссылка просто заменяется ею.
+    if is_link(to) {
+        std::fs::remove_file(to)?;
+    }
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -153,18 +159,35 @@ fn place(from: &Path, to: &Path, rel: &Path, owned: &mut BTreeSet<String>) -> Re
 }
 
 /// Убрать файл прошлого пака и опустевшие после него папки.
+///
+/// Список прошлого пака лежит в каталоге сервера, а значит, его переписывает и
+/// процесс сервера. Строка `../../etc/passwd` в нём превращала обновление пака
+/// в удаление файла хоста от root, поэтому каждая проходит через разрешатель,
+/// а удаляется только файл или ссылка — не каталог.
 fn remove_stale(root: &Path, rel: &str) {
-    let path = root.join(rel);
-    if std::fs::remove_file(&path).is_err() {
+    let Ok(path) = crate::fs::resolve_entry(root, rel) else {
+        tracing::warn!(path = rel, "строка списка пака выходит за каталог сервера");
+        return;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+        || crate::fs::nofollow::remove(&path).is_err()
+    {
         return;
     }
     let mut dir = path.parent();
     while let Some(d) = dir {
-        if d == root || std::fs::remove_dir(d).is_err() {
+        if d == root || !d.starts_with(&root) || std::fs::remove_dir(d).is_err() {
             break;
         }
         dir = d.parent();
     }
+}
+
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Многие паки упакованы с папкой верхнего уровня; содержимое — в ней.
@@ -194,6 +217,12 @@ fn is_kept_dir(name: &str, world: &str) -> bool {
 
 /// Дописать в `to` то, чего там нет; существующее не трогать.
 fn merge_missing(from: &Path, to: &Path) -> Result<()> {
+    // Папка не принадлежит паку, и ссылку на её месте поставил владелец или его
+    // плагин. Идти по ней нельзя, сносить чужое — тоже: папка пропускается.
+    if is_link(to) {
+        tracing::warn!(path = %to.display(), "на месте папки пака ссылка — не трогаю");
+        return Ok(());
+    }
     if !to.exists() {
         std::fs::rename(from, to)?;
         return Ok(());

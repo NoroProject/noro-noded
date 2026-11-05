@@ -214,3 +214,43 @@ fn a_pack_wrapped_in_a_folder_is_unwrapped() {
     assert_eq!(s.read("mods/a.jar").as_deref(), Some("a"));
     assert!(s.read("GTNH-Server").is_none());
 }
+
+/// Список прошлого пака пишется и процессом сервера: строка из него не может
+/// увести удаление за каталог сервера.
+#[test]
+fn a_forged_record_cannot_delete_outside_the_server() {
+    let s = Sandbox::new();
+    let outside = s.root.with_extension("host-file");
+    fs::write(&outside, "host").unwrap();
+    let escape = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+    s.put(
+        RECORD,
+        &serde_json::to_string(&[escape.as_str(), "world"]).unwrap(),
+    );
+    s.put("world/level.dat", "lvl");
+
+    s.apply(&[("mods/a.jar", "a")]);
+
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "host");
+    assert_eq!(s.read("world/level.dat").as_deref(), Some("lvl"));
+    fs::remove_file(outside).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn a_linked_pack_directory_is_replaced_not_followed() {
+    let s = Sandbox::new();
+    let outside = s.root.with_extension("host-dir");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, s.root.join("mods")).unwrap();
+    std::os::unix::fs::symlink(&outside, s.root.join("journeymap")).unwrap();
+
+    s.apply(&[("mods/a.jar", "a"), ("journeymap/settings.cfg", "x")]);
+
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "наружу ничего не легло"
+    );
+    assert_eq!(s.read("mods/a.jar").as_deref(), Some("a"));
+    fs::remove_dir_all(outside).unwrap();
+}

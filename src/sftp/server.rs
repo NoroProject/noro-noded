@@ -28,6 +28,7 @@ pub struct SftpServer {
     pub master: MasterClient,
     pub data_dir: PathBuf,
     pub events: mpsc::Sender<NodeEvent>,
+    pub quota: crate::fs::quota::Quota,
 }
 
 impl russh::server::Server for SftpServer {
@@ -38,6 +39,7 @@ impl russh::server::Server for SftpServer {
             master: self.master.clone(),
             data_dir: self.data_dir.clone(),
             events: self.events.clone(),
+            quota: self.quota.clone(),
             grant: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -48,6 +50,7 @@ pub struct Connection {
     master: MasterClient,
     data_dir: PathBuf,
     events: mpsc::Sender<NodeEvent>,
+    quota: crate::fs::quota::Quota,
     /// Заполняется после успешной аутентификации — из него берутся корень и права.
     grant: Option<SftpGrant>,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
@@ -136,7 +139,7 @@ impl Handler for Connection {
             .data_dir
             .join("servers")
             .join(grant.panel_server_id.to_string());
-        let sftp = SftpSession::new(root, grant, self.events.clone());
+        let sftp = SftpSession::new(root, grant, self.events.clone(), self.quota.clone());
 
         session.channel_success(channel_id)?;
         russh_sftp::server::run(channel.into_stream(), sftp).await;

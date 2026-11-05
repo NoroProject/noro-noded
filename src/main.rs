@@ -206,6 +206,7 @@ async fn start_sftp(daemon: &Daemon) {
         master: daemon.master.clone(),
         data_dir: daemon.cfg.data_dir.clone(),
         events: daemon.events.clone(),
+        quota: daemon.quota.clone(),
     };
     match sftp::server::start(server, &daemon.cfg.sftp.bind).await {
         Ok(fingerprint) => {

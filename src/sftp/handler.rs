@@ -15,10 +15,23 @@ use tokio::sync::mpsc;
 use super::auth::SftpGrant;
 use schema::noded::{NodeEvent, SftpActionKind};
 
+/// Самый большой кусок, который отдаётся одним `read`. Длину называет клиент,
+/// и без потолка один запрос просил у ноды буфер до четырёх гигабайт — любым
+/// логином, даже с правом только на чтение. Клиенты сами просят 32–256 КБ.
+const MAX_READ: u32 = 256 * 1024;
+
+/// Сколько файлов и каталогов сессия держит открытыми разом. Без предела
+/// клиент открывал файлы, не закрывая, пока у демона не кончались дескрипторы
+/// — на всех серверах ноды сразу.
+const MAX_HANDLES: usize = 256;
+
 pub struct SftpSession {
     pub root: PathBuf,
     pub grant: SftpGrant,
     pub events: mpsc::Sender<NodeEvent>,
+    /// Квота диска сервера: SFTP пишет в тот же каталог, что и браузер, и
+    /// обходить лимит не должен.
+    quota: crate::fs::quota::Quota,
     /// Открытые файлы и каталоги: протокол адресует их строкой-ручкой.
     files: HashMap<String, std::fs::File>,
     dirs: HashMap<String, Vec<File>>,
@@ -26,11 +39,17 @@ pub struct SftpSession {
 }
 
 impl SftpSession {
-    pub fn new(root: PathBuf, grant: SftpGrant, events: mpsc::Sender<NodeEvent>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        grant: SftpGrant,
+        events: mpsc::Sender<NodeEvent>,
+        quota: crate::fs::quota::Quota,
+    ) -> Self {
         Self {
             root,
             grant,
             events,
+            quota,
             files: HashMap::new(),
             dirs: HashMap::new(),
             version: None,
@@ -52,6 +71,17 @@ impl SftpSession {
         } else {
             Err(StatusCode::PermissionDenied)
         }
+    }
+
+    /// Новая ручка сверх предела — отказ; повторное открытие той же ручки
+    /// места не занимает.
+    fn room_for_handle(&self, handle: &str) -> Result<(), StatusCode> {
+        let open = self.files.len() + self.dirs.len();
+        let reused = self.files.contains_key(handle) || self.dirs.contains_key(handle);
+        if open >= MAX_HANDLES && !reused {
+            return Err(StatusCode::Failure);
+        }
+        Ok(())
     }
 
     fn require_delete(&self) -> Result<(), StatusCode> {
@@ -137,6 +167,7 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        self.room_for_handle(&path)?;
         let dir = self.resolve(&path)?;
         let listing = std::fs::read_dir(&dir).map_err(|_| StatusCode::NoSuchFile)?;
 
@@ -177,6 +208,7 @@ impl russh_sftp::server::Handler for SftpSession {
         if writing {
             self.require_write()?;
         }
+        self.room_for_handle(&filename)?;
 
         let path = self.resolve(&filename)?;
         let file = std::fs::OpenOptions::new()
@@ -210,7 +242,7 @@ impl russh_sftp::server::Handler for SftpSession {
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| StatusCode::Failure)?;
 
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; len.min(MAX_READ) as usize];
         let read = file.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         if read == 0 {
             return Err(StatusCode::Eof);
@@ -229,10 +261,19 @@ impl russh_sftp::server::Handler for SftpSession {
         use std::io::{Seek, SeekFrom, Write};
 
         self.require_write()?;
+        // Перезапись уже существующих байт тоже считается ростом: кэш квоты
+        // ошибается в безопасную сторону и выправляется следующим замером.
+        let server = self.grant.panel_server_id;
+        let extra = data.len() as u64;
+        self.quota
+            .check(server, &self.root, extra)
+            .await
+            .map_err(|_| StatusCode::Failure)?;
         let file = self.files.get_mut(&handle).ok_or(StatusCode::Failure)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| StatusCode::Failure)?;
         file.write_all(&data).map_err(|_| StatusCode::Failure)?;
+        self.quota.add(server, extra);
         Ok(Self::ok(id))
     }
 
@@ -352,9 +393,39 @@ mod tests {
             can_delete: false,
         };
         let (tx, _rx) = mpsc::channel(1);
-        let session = SftpSession::new(PathBuf::from("/srv/x"), grant, tx);
+        let session = SftpSession::new(
+            PathBuf::from("/srv/x"),
+            grant,
+            tx,
+            crate::fs::quota::Quota::default(),
+        );
         assert_eq!(session.root, PathBuf::from("/srv/x"));
         assert!(session.require_write().is_err(), "без права записи — отказ");
         assert!(session.require_delete().is_err());
+    }
+
+    #[test]
+    fn open_handles_are_capped() {
+        let grant = SftpGrant {
+            user_id: uuid::Uuid::nil(),
+            panel_server_id: uuid::Uuid::nil(),
+            can_write: false,
+            can_delete: false,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let mut session = SftpSession::new(
+            PathBuf::from("/srv/x"),
+            grant,
+            tx,
+            crate::fs::quota::Quota::default(),
+        );
+        for n in 0..MAX_HANDLES {
+            session.dirs.insert(format!("/d{n}"), Vec::new());
+        }
+        assert!(session.room_for_handle("/another").is_err());
+        assert!(
+            session.room_for_handle("/d0").is_ok(),
+            "повторное открытие той же ручки не занимает места"
+        );
     }
 }

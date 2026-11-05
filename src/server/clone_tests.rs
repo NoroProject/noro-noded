@@ -149,3 +149,32 @@ fn a_missing_source_is_an_error_not_an_empty_copy() {
 
     assert!(run(&dir.path().join("nope"), &to, false).is_err());
 }
+
+#[test]
+#[cfg(unix)]
+fn links_on_either_side_lead_nowhere() {
+    let base = TempDir::new();
+    let from = base.path().join("from");
+    let to = base.path().join("to");
+    let host = base.path().join("host");
+    tree(&from, &[("config/a.toml", "a")]);
+    tree(&host, &[("secret.txt", "host")]);
+    std::fs::create_dir_all(&to).unwrap();
+    std::os::unix::fs::symlink(&host, from.join("stolen")).unwrap();
+    std::os::unix::fs::symlink(&host, to.join("config")).unwrap();
+
+    run(&from, &to, false).unwrap();
+
+    assert!(
+        !to.join("stolen").exists(),
+        "a link in the source is not copied"
+    );
+    assert!(
+        !host.join("a.toml").exists(),
+        "a link in the target does not carry the copy out"
+    );
+    assert_eq!(
+        std::fs::read_to_string(to.join("config/a.toml")).unwrap(),
+        "a"
+    );
+}

@@ -54,31 +54,48 @@ fn copy_dir(
     at_root: bool,
     report: &mut Report,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+    // The source directory is opened and checked once, then listed through
+    // that handle: the source server may be running and could swap a
+    // directory for a link to a host one mid-copy, which would carry host
+    // files into a server its owner can download from.
+    let dir = crate::fs::nofollow::Dir::open(from)
+        .with_context(|| format!("opening {}", from.display()))?;
+    for entry in dir
+        .read_dir()
+        .with_context(|| format!("reading {}", from.display()))?
+    {
         let entry = entry?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if at_root && skip(&name, include_worlds) {
+        if at_root && skip(&name.to_string_lossy(), include_worlds) {
             continue;
         }
 
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
+        let src = from.join(&name);
+        let dst = to.join(&name);
         // Symlinks are not followed: one pointing outside the source would turn
         // the copy into a way of reading the node's filesystem.
-        let meta = std::fs::symlink_metadata(&src)?;
+        let meta = entry.metadata()?;
         if meta.file_type().is_symlink() {
             continue;
         }
 
         if meta.is_dir() {
+            // A link in the target where a directory goes would carry the copy
+            // out of the target server; the clone owns that spot, so the link
+            // goes.
+            if std::fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_symlink()) {
+                std::fs::remove_file(&dst)?;
+            }
             std::fs::create_dir_all(&dst)?;
             copy_dir(&src, &dst, include_worlds, false, report)?;
-        } else {
-            std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
+        } else if meta.is_file() {
+            let mut input = crate::fs::nofollow::open_existing(&src, false)
+                .with_context(|| format!("opening {}", src.display()))?;
+            let mut output = crate::fs::nofollow::create_replacing(&dst)
+                .with_context(|| format!("creating {}", dst.display()))?;
+            report.bytes += std::io::copy(&mut input, &mut output)
+                .with_context(|| format!("copying {}", src.display()))?;
             report.files += 1;
-            report.bytes += meta.len();
         }
     }
     Ok(())

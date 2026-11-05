@@ -611,8 +611,16 @@ async fn power(daemon: &Daemon, server: Uuid, action: PowerAction) -> OpResult {
     // который мастер гасит этой же командой.
     let handle = daemon.registry.get_or_create(server);
     match action {
-        PowerAction::Start | PowerAction::Restart => {
+        PowerAction::Start => {
             handle.starting_on_purpose();
+            daemon.ensure_server_port(server).await;
+        }
+        PowerAction::Restart => {
+            // Остановка внутри перезапуска — тоже намеренная. Иначе выход с
+            // ненулевым кодом (Forge часто выходит так и на `stop`) присмотр
+            // прошлого запуска принимал за падение и сам брался поднимать.
+            handle.stopping_on_purpose();
+            handle.next_generation();
             daemon.ensure_server_port(server).await;
         }
         PowerAction::Stop | PowerAction::Kill => handle.stopping_on_purpose(),
@@ -627,6 +635,7 @@ async fn power(daemon: &Daemon, server: Uuid, action: PowerAction) -> OpResult {
         PowerAction::Kill => engine.kill(server).await,
         PowerAction::Restart => {
             engine.stop(server).await.ok();
+            handle.starting_on_purpose();
             engine.start(server).await.map_err(docker_error)?;
             return attach(daemon, server).await;
         }

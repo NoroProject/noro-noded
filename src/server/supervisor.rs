@@ -50,12 +50,20 @@ async fn attach_inner(
 ) -> Result<()> {
     let (console_rx, writer) = console::attach(&engine, server).await?;
     let handle = registry.get_or_create(server);
-    *handle.writer.lock().await = Some(writer);
+    // Номер и ручка меняются под одним замком: присмотр прошлого запуска
+    // сверяет номер под ним же, прежде чем снять ручку.
+    let generation = {
+        let mut slot = handle.writer.lock().await;
+        *slot = Some(writer);
+        handle.next_generation()
+    };
     handle.set_power(PowerState::Starting);
 
     offer(&outbox, state_event(server, &handle, 0, None));
 
-    tokio::spawn(pump(engine, registry, handle, outbox, console_rx, server));
+    tokio::spawn(pump(
+        engine, registry, handle, outbox, console_rx, server, generation,
+    ));
     Ok(())
 }
 
@@ -77,12 +85,18 @@ async fn pump(
     outbox: mpsc::Sender<NodeEvent>,
     mut console_rx: mpsc::Receiver<ConsoleBatch>,
     server: Uuid,
+    generation: u64,
 ) {
     // Строки, выброшенные из-за полной очереди, не пропадают бесследно: их
     // число уходит со следующей пачкой тем же `skipped`, что и при переполнении
     // кадра.
     let mut dropped: u32 = 0;
     while let Some(batch) = console_rx.recv().await {
+        // К тому же контейнеру уже сел новый присмотр: второй поток слал бы
+        // каждую строку дважды. Уход отсюда закрывает и поток докера.
+        if handle.generation() != generation {
+            return;
+        }
         if !handle.state().ready && batch.lines.iter().any(|l| console::marks_ready(l)) {
             handle.set_ready();
             handle.set_power(PowerState::Running);
@@ -103,7 +117,18 @@ async fn pump(
         }
     }
 
-    // Поток закрыт — контейнер больше не пишет. Чем это кончилось, знает докер.
+    // Поток закрыт — контейнер больше не пишет. Если за это время сервер
+    // успели поднять заново, всё ниже — забота нового присмотра: снять его
+    // ручку stdin или доложить о «падении» значило бы соврать о живом.
+    {
+        let mut slot = handle.writer.lock().await;
+        if handle.generation() != generation {
+            return;
+        }
+        *slot = None;
+    }
+
+    // Чем это кончилось, знает докер.
     let (power, exit_code, uptime) =
         engine
             .state(server)
@@ -111,7 +136,6 @@ async fn pump(
             .unwrap_or((PowerState::Offline, None, 0));
     handle.set_power(power);
     let stopped_by_user = handle.state().stopped_on_purpose;
-    *handle.writer.lock().await = None;
 
     // Без ожидания и здесь: подъём упавшего сервера ниже не должен ждать,
     // пока вернётся мастер.
@@ -135,7 +159,7 @@ async fn pump(
     // Поднимаем только упавшее. Штатный выход — это `stop` изнутри игры или
     // команда человека, и воскрешать его было бы спором с тем, кто её дал.
     if matches!(power, PowerState::Crashed | PowerState::OomKilled) {
-        try_restart(engine, registry, outbox, server, power).await;
+        try_restart(engine, registry, outbox, server, power, generation).await;
     }
 }
 
@@ -146,6 +170,7 @@ async fn try_restart(
     outbox: mpsc::Sender<NodeEvent>,
     server: Uuid,
     power: PowerState,
+    generation: u64,
 ) {
     let handle = registry.get_or_create(server);
     let Some(attempt) = handle.take_restart_slot(MAX_RESTARTS) else {
@@ -168,8 +193,9 @@ async fn try_restart(
     );
     tokio::time::sleep(pause).await;
 
-    // Между падением и подъёмом человек мог погасить сервер сам — проверяем ещё раз.
-    if handle.state().stopped_on_purpose {
+    // Между падением и подъёмом человек мог погасить сервер сам или поднять
+    // его заново — проверяем ещё раз.
+    if handle.state().stopped_on_purpose || handle.generation() != generation {
         return;
     }
 

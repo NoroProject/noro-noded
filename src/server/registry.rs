@@ -32,6 +32,13 @@ pub struct ServerHandle {
     /// остановкой.
     pub writer: tokio::sync::Mutex<Option<ConsoleWriter>>,
     state: parking_lot::Mutex<RuntimeState>,
+    /// Номер текущего присоединения к консоли.
+    ///
+    /// Перезапуск и пересборка садятся на консоль заново, а присмотр за прошлым
+    /// запуском доживает своё уже после этого: без номера он снимал ручку
+    /// stdin нового запуска («консоль недоступна» сразу после рестарта) и мог
+    /// поднять сервер, который и так уже поднят.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl ServerHandle {
@@ -39,7 +46,19 @@ impl ServerHandle {
         Self {
             writer: tokio::sync::Mutex::new(None),
             state: parking_lot::Mutex::new(RuntimeState::default()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Завести новое присоединение; все прежние с этого момента устарели.
+    pub fn next_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     pub fn state(&self) -> RuntimeState {
@@ -186,6 +205,15 @@ mod tests {
         handle.forget_restarts();
 
         assert_eq!(handle.take_restart_slot(MAX), Some(1));
+    }
+
+    #[test]
+    fn a_new_attachment_outdates_the_previous_one() {
+        let handle = Registry::default().get_or_create(Uuid::nil());
+        let first = handle.next_generation();
+        let second = handle.next_generation();
+        assert_ne!(first, second);
+        assert_eq!(handle.generation(), second);
     }
 
     #[test]

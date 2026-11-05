@@ -59,3 +59,33 @@ fn open_handles_are_capped() {
         "повторное открытие той же ручки не занимает места"
     );
 }
+
+#[tokio::test]
+async fn a_big_directory_is_listed_in_batches() {
+    use russh_sftp::server::Handler;
+    let grant = SftpGrant {
+        user_id: uuid::Uuid::nil(),
+        panel_server_id: uuid::Uuid::nil(),
+        can_write: false,
+        can_delete: false,
+    };
+    let (tx, _rx) = mpsc::channel(1);
+    let mut session = SftpSession::new(
+        PathBuf::from("/srv/x"),
+        grant,
+        tx,
+        crate::fs::quota::Quota::default(),
+    );
+    let files = (0..300)
+        .map(|n| File::dummy(format!("r.{n}.mca")))
+        .collect();
+    session.dirs.insert("/world/region".into(), files);
+
+    let mut seen = 0;
+    while let Ok(name) = session.readdir(1, "/world/region".into()).await {
+        assert!(name.files.len() <= READDIR_BATCH);
+        seen += name.files.len();
+    }
+    assert_eq!(seen, 300);
+    assert!(session.dirs.is_empty(), "после EOF ручка закрыта");
+}

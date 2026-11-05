@@ -13,12 +13,17 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::auth::SftpGrant;
+use super::blocking;
 use schema::noded::{NodeEvent, SftpActionKind};
 
 /// Самый большой кусок, который отдаётся одним `read`. Длину называет клиент,
 /// и без потолка один запрос просил у ноды буфер до четырёх гигабайт — любым
 /// логином, даже с правом только на чтение. Клиенты сами просят 32–256 КБ.
 const MAX_READ: u32 = 256 * 1024;
+
+/// Сколько записей каталога уходит одним ответом: с длинной строкой `ls -l`
+/// на каждую это десятки килобайт, вчетверо меньше предела пакета OpenSSH.
+const READDIR_BATCH: usize = 128;
 
 /// Сколько файлов и каталогов сессия держит открытыми разом. Без предела
 /// клиент открывал файлы, не закрывая, пока у демона не кончались дескрипторы
@@ -199,12 +204,16 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        // Каталог отдаётся одним ответом, дальше — EOF: иначе клиент будет
-        // спрашивать его по кругу.
-        match self.dirs.remove(&handle) {
-            Some(files) => Ok(Name { id, files }),
-            None => Err(StatusCode::Eof),
+        // Порциями, а после последней — EOF. Одним ответом каталог с регионами
+        // мира не влезал в пакет: OpenSSH принимает до 256 КБ и рвал сессию
+        // на «message too long».
+        let files = self.dirs.get_mut(&handle).ok_or(StatusCode::Eof)?;
+        if files.is_empty() {
+            self.dirs.remove(&handle);
+            return Err(StatusCode::Eof);
         }
+        let batch = files.drain(..files.len().min(READDIR_BATCH)).collect();
+        Ok(Name { id, files: batch })
     }
 
     async fn open(
@@ -377,18 +386,6 @@ impl russh_sftp::server::Handler for SftpSession {
         _targetpath: String,
     ) -> Result<Status, Self::Error> {
         Err(StatusCode::OpUnsupported)
-    }
-}
-
-/// Удаление мира или листинг на десятки тысяч файлов шли прямо на рабочем
-/// потоке рантайма и останавливали консоли всей ноды. `block_in_place` отдаёт
-/// остальные задачи другим потокам, не вынося состояние сессии в задачу.
-fn blocking<T>(work: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(work)
-        }
-        _ => work(),
     }
 }
 

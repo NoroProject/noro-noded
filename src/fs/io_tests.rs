@@ -39,3 +39,37 @@ fn the_service_directory_is_off_limits() {
     assert!(copy(&root, "world", ".noro/world").is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[cfg(unix)]
+fn deleting_a_link_keeps_what_it_points_to() {
+    let root = sandbox();
+    std::os::unix::fs::symlink(root.join("world"), root.join("old-world")).unwrap();
+    let outside = root.with_extension("outside");
+    std::fs::write(&outside, b"host").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("planted")).unwrap();
+
+    delete(&root, "old-world").unwrap();
+    assert!(root.join("world/level.dat").exists(), "мир на месте");
+    assert!(std::fs::symlink_metadata(root.join("old-world")).is_err());
+
+    delete(&root, "planted").unwrap();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"host");
+    assert!(std::fs::symlink_metadata(root.join("planted")).is_err());
+
+    std::fs::remove_file(outside).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn renaming_onto_a_link_replaces_the_link() {
+    let root = sandbox();
+    std::fs::write(root.join("new.txt"), b"new").unwrap();
+    std::os::unix::fs::symlink(root.join("world/level.dat"), root.join("target.txt")).unwrap();
+
+    rename(&root, "new.txt", "target.txt").unwrap();
+    assert_eq!(std::fs::read(root.join("world/level.dat")).unwrap(), b"lvl");
+    assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"new");
+    std::fs::remove_dir_all(root).unwrap();
+}

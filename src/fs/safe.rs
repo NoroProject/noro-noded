@@ -102,6 +102,30 @@ pub fn resolve_existing(root: &Path, rel: &str) -> Result<PathBuf> {
     resolve(root, rel)
 }
 
+/// Путь к самой записи каталога: последний компонент не разворачивается.
+///
+/// Удалять и переименовывать надо то, что названо, а не то, куда оно ведёт.
+/// Через `resolve` удаление ссылки `mods/old -> world` сносило весь мир, а
+/// ссылку наружу — подложенную как раз для того, чтобы её убрали, — снять было
+/// нельзя вовсе: разрешатель отвечал «побег». Каталог, в котором лежит запись,
+/// проверяется как обычно.
+pub fn resolve_entry(root: &Path, rel: &str) -> Result<PathBuf> {
+    let cleaned = clean(rel)?;
+    let name = cleaned.file_name().ok_or(PathError::Invalid)?.to_owned();
+    let parent_rel = cleaned
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let parent = resolve(root, &parent_rel)?;
+    let canonical_root = root.canonicalize().map_err(|_| PathError::Invalid)?;
+    let entry = parent.join(name);
+    if is_hidden(&relative_to(&canonical_root, &entry)) {
+        return Err(PathError::Escapes);
+    }
+    Ok(entry)
+}
+
 /// Разобрать относительный путь, отвергнув всё, чем из корня выходят.
 fn clean(rel: &str) -> Result<PathBuf> {
     if rel.contains('\0') {

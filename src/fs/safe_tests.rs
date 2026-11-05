@@ -199,3 +199,33 @@ fn the_service_directory_is_hidden() {
     assert!(!is_hidden("mods/.noro-ish.jar"));
     assert!(!is_hidden("config/noro.toml"));
 }
+
+/// Удаляют и переименовывают саму запись: ссылку — как ссылку.
+#[test]
+#[cfg(unix)]
+fn an_entry_is_the_link_itself_not_its_target() {
+    let s = Sandbox::new();
+    std::os::unix::fs::symlink(s.root.join("server.properties"), s.root.join("props.link"))
+        .expect("симлинк внутрь");
+    std::os::unix::fs::symlink(&s.outside, s.root.join("mods/escape")).expect("симлинк наружу");
+
+    let canonical = s.root.canonicalize().unwrap();
+    assert_eq!(
+        resolve_entry(&s.root, "props.link").unwrap(),
+        canonical.join("props.link")
+    );
+    assert_eq!(
+        resolve_entry(&s.root, "mods/escape").unwrap(),
+        canonical.join("mods/escape"),
+        "ссылку наружу можно назвать, чтобы её снять"
+    );
+    // Каталог записи проверяется как прежде.
+    std::os::unix::fs::symlink(&s.outside, s.root.join("out")).expect("симлинк");
+    assert_eq!(
+        resolve_entry(&s.root, "out/token.txt"),
+        Err(PathError::Escapes)
+    );
+    assert_eq!(resolve_entry(&s.root, ""), Err(PathError::Invalid));
+    assert_eq!(resolve_entry(&s.root, ".noro"), Err(PathError::Escapes));
+    assert_eq!(resolve_entry(&s.root, "../x"), Err(PathError::Escapes));
+}

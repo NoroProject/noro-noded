@@ -7,7 +7,7 @@ pub mod nofollow;
 pub mod quota;
 pub mod safe;
 
-pub use safe::{is_hidden, resolve, resolve_existing};
+pub use safe::{is_hidden, resolve, resolve_entry, resolve_existing};
 
 /// Потолок на текст, который отдаётся в браузер целиком.
 ///

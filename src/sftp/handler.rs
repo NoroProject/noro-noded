@@ -65,6 +65,16 @@ impl SftpSession {
         crate::fs::resolve(&self.root, rel).map_err(|_| StatusCode::PermissionDenied)
     }
 
+    /// Сама запись каталога, без разворачивания последнего компонента: удаление
+    /// и переименование ссылки должны трогать ссылку, а не то, куда она ведёт.
+    fn resolve_entry(&self, path: &str) -> Result<PathBuf, StatusCode> {
+        let rel = path.trim_start_matches('/');
+        if crate::fs::is_hidden(rel) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        crate::fs::resolve_entry(&self.root, rel).map_err(|_| StatusCode::PermissionDenied)
+    }
+
     fn require_write(&self) -> Result<(), StatusCode> {
         if self.grant.can_write {
             Ok(())
@@ -331,7 +341,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
-        let path = self.resolve(&filename)?;
+        let path = self.resolve_entry(&filename)?;
         std::fs::remove_file(path).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Delete, &filename);
         Ok(Self::ok(id))
@@ -339,7 +349,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
-        let dir = self.resolve(&path)?;
+        let dir = self.resolve_entry(&path)?;
         std::fs::remove_dir_all(dir).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Delete, &path);
         Ok(Self::ok(id))
@@ -352,8 +362,8 @@ impl russh_sftp::server::Handler for SftpSession {
         newpath: String,
     ) -> Result<Status, Self::Error> {
         self.require_write()?;
-        let from = self.resolve(&oldpath)?;
-        let to = self.resolve(&newpath)?;
+        let from = self.resolve_entry(&oldpath)?;
+        let to = self.resolve_entry(&newpath)?;
         std::fs::rename(from, to).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Rename, &newpath);
         Ok(Self::ok(id))

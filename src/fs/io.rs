@@ -88,13 +88,13 @@ pub fn delete(root: &Path, rel: &str) -> Result<()> {
     if rel.trim_matches('/').is_empty() {
         bail!("корень сервера не удаляется");
     }
-    let path = super::resolve(root, rel)?;
+    // Симлинк удаляется как есть: снять подложенную ссылку должно быть можно,
+    // даже если ходить по ней нельзя, а то, на что она ведёт, остаётся.
+    let path = super::resolve_entry(root, rel)?;
     let meta = std::fs::symlink_metadata(&path)?;
     if meta.is_dir() {
         std::fs::remove_dir_all(path)?;
     } else {
-        // Симлинк удаляем как есть: снять подложенную ссылку должно быть можно,
-        // даже если ходить по ней нельзя.
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -104,7 +104,9 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
     guard_hidden(from)?;
     guard_hidden(to)?;
     let src = super::resolve_existing(root, from)?;
-    let dst = super::resolve(root, to)?;
+    // Ссылка на месте цели заменяется, как и любой файл: через `resolve`
+    // переименование ложилось поверх того, на что она указывала.
+    let dst = super::resolve_entry(root, to)?;
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }

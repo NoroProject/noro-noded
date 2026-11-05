@@ -47,7 +47,8 @@ fn heavy(op: &NodeOp) -> Option<(Uuid, &'static str)> {
 
 async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
     match op {
-        NodeOp::NodeInfo => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
+        // Версия — как и прежде, остальное — для разбора «что с нодой».
+        NodeOp::NodeInfo => Ok(crate::diag::report(daemon)),
 
         NodeOp::ImagePull { image } => daemon
             .engine

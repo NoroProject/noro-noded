@@ -30,7 +30,9 @@ const STATE_POLL: Duration = Duration::from_secs(20);
 pub async fn run(daemon: Daemon, mut events: mpsc::Receiver<NodeEvent>) -> ! {
     let mut backoff = BACKOFF_START;
     loop {
-        match connect_once(&daemon, &mut events).await {
+        let result = connect_once(&daemon, &mut events).await;
+        daemon.health.disconnected();
+        match result {
             Ok(()) => {
                 tracing::warn!("мастер закрыл соединение");
                 backoff = BACKOFF_START;
@@ -65,6 +67,7 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
     let hello = hello(daemon).await?;
     tx.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
+    daemon.health.connected();
 
     let mut poll = tokio::time::interval(STATE_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -81,11 +84,13 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
                 match message? {
                     Message::Text(text) => {
                         last_seen = tokio::time::Instant::now();
+                        daemon.health.touch();
                         handle_frame(daemon, &replies_tx, &text);
                     }
                     Message::Ping(payload) => {
                         tx.send(Message::Pong(payload)).await?;
                         last_seen = tokio::time::Instant::now();
+                        daemon.health.touch();
                     }
                     Message::Close(_) => return Ok(()),
                     _ => {}

@@ -114,6 +114,8 @@ async fn pump(
             dropped = 0;
         } else {
             dropped = dropped.saturating_add(lost);
+            crate::diag::DROPPED_CONSOLE_LINES
+                .fetch_add(u64::from(lost), std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -30,6 +30,7 @@ pub use tickets::Tickets;
 pub fn router(daemon: Daemon) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/status", get(status))
         .route("/transfer/{ticket}", get(download).post(upload).put(upload))
         .layer(axum::middleware::from_fn(cors))
         .with_state(daemon)
@@ -82,13 +83,29 @@ pub async fn serve(daemon: Daemon) {
     };
     tracing::info!(%bind, "прямая передача слушает");
 
-    if let Err(e) = axum::serve(listener, router(daemon)).await {
+    let app = router(daemon).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if let Err(e) = axum::serve(listener, app).await {
         tracing::error!(error = %e, "слушатель прямой передачи остановился");
     }
 }
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Отчёт о состоянии демона — только с самой машины.
+///
+/// Порт прямой передачи смотрит в интернет, а отчёт называет серверы ноды и
+/// отпечаток SFTP: снаружи ему делать нечего. Оператор спрашивает его с
+/// машины, мастер — через `NodeInfo`.
+async fn status(
+    State(daemon): State<Daemon>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !peer.ip().to_canonical().is_loopback() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    axum::Json(crate::diag::report(&daemon)).into_response()
 }
 
 async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Response {

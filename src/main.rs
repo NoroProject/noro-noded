@@ -7,6 +7,7 @@
 
 mod backup;
 mod config;
+mod diag;
 mod docker;
 mod fs;
 mod http;
@@ -64,6 +65,8 @@ pub struct Daemon {
     pub wake_gate: server::wake_gate::WakeGate,
     /// Какие серверы заняты тяжёлой операцией.
     pub busy: server::busy::Busy,
+    /// Связь с мастером и прочее состояние самого демона.
+    pub health: Arc<diag::Health>,
 }
 
 impl Daemon {
@@ -116,6 +119,7 @@ async fn main() -> Result<()> {
         placeholders: Arc::new(dashmap::DashMap::new()),
         wake_gate: server::wake_gate::WakeGate::default(),
         busy: server::busy::Busy::default(),
+        health: Arc::new(diag::Health::default()),
     };
 
     // Переподключиться к тому, что уже работает, до первого кадра мастеру:

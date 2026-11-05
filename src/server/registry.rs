@@ -113,9 +113,19 @@ impl ServerHandle {
 #[derive(Default, Clone)]
 pub struct Registry {
     servers: Arc<DashMap<Uuid, Arc<ServerHandle>>>,
+    /// Отпечатки падений. Здесь, а не отдельной ручкой: пишет их присмотр за
+    /// запуском, а до него доходит только реестр.
+    pub crashes: crate::server::crash::CrashStore,
 }
 
 impl Registry {
+    pub fn new(crashes: crate::server::crash::CrashStore) -> Self {
+        Self {
+            servers: Arc::default(),
+            crashes,
+        }
+    }
+
     pub fn get_or_create(&self, server: Uuid) -> Arc<ServerHandle> {
         self.servers
             .entry(server)

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::docker::console::{self, ConsoleBatch};
 use crate::docker::Engine;
+use crate::server::crash;
 use crate::server::registry::{Registry, ServerHandle};
 
 /// Сколько раз подряд поднимать упавший сервер.
@@ -92,6 +93,8 @@ async fn pump(
     // число уходит со следующей пачкой тем же `skipped`, что и при переполнении
     // кадра.
     let mut dropped: u32 = 0;
+    let mut tail = crash::Tail::default();
+    let run_started = std::time::SystemTime::now();
     while let Some(batch) = console_rx.recv().await {
         // К тому же контейнеру уже сел новый присмотр: второй поток слал бы
         // каждую строку дважды. Уход отсюда закрывает и поток докера.
@@ -105,6 +108,7 @@ async fn pump(
             offer(&outbox, state_event(server, &handle, 0, None));
         }
 
+        tail.push(&batch.lines);
         let lost = batch.lines.len() as u32 + batch.skipped;
         let event = NodeEvent::Console {
             server,
@@ -162,6 +166,20 @@ async fn pump(
     // Поднимаем только упавшее. Штатный выход — это `stop` изнутри игры или
     // команда человека, и воскрешать его было бы спором с тем, кто её дал.
     if matches!(power, PowerState::Crashed | PowerState::OomKilled) {
+        // Отпечаток — до подъёма: следующий запуск начнёт писать свой лог.
+        if !stopped_by_user {
+            let crash = crash::Crash {
+                state: power,
+                exit_code,
+                run_started,
+                console: tail.take(),
+            };
+            let store = registry.crashes.clone();
+            let saved = tokio::task::spawn_blocking(move || store.record(server, crash)).await;
+            if let Ok(Err(e)) = saved {
+                tracing::warn!(%server, error = %format!("{e:#}"), "отпечаток падения не сохранён");
+            }
+        }
         try_restart(engine, registry, outbox, server, power, generation).await;
     }
 }

@@ -179,6 +179,14 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             ttl_secs,
         } => backup::ticket(daemon, server, backup, ttl_secs).await,
 
+        NodeOp::CrashReport { server, crash } => {
+            let store = daemon.registry.crashes.clone();
+            blocking(move || store.read(server, crash.as_deref()))
+                .await
+                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                .map_err(|e| OpError::new("not_found", format!("{e:#}")))
+        }
+
         NodeOp::SftpReload => Ok(Value::Null),
     }
 }

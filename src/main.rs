@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         engine: engine.clone(),
         master,
-        registry: Registry::default(),
+        registry: Registry::new(server::crash::CrashStore::new(cfg.clone())),
         events: events_tx.clone(),
         sftp_fingerprint: Arc::new(parking_lot::Mutex::new(None)),
         http_tickets: http::Tickets::default(),

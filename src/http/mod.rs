@@ -131,8 +131,10 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     // Потоком, а не целиком в память: бэкап мира не обязан помещаться в
-    // оперативку демона.
-    let body = Body::from_stream(ReaderStream::new(file));
+    // оперативку демона. Ровно заявленную длину: лог живого сервера растёт,
+    // пока его качают, и лишние байты сверх `Content-Length` обрывали
+    // скачивание ошибкой у самого конца.
+    let body = Body::from_stream(ReaderStream::new(tokio::io::AsyncReadExt::take(file, len)));
     (
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),

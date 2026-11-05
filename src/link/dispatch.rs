@@ -131,6 +131,10 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
         }
 
         NodeOp::ServerDelete { server, keep_files } => {
+            // Держатель порта спящего сервера иначе переживал сам сервер и
+            // занимал порт до перезапуска демона — новому серверу на этом
+            // порту было не стартовать.
+            daemon.placeholders.remove(&server);
             if daemon.engine.exists(server).await {
                 daemon.engine.remove(server).await.ok();
             }
@@ -682,6 +686,12 @@ async fn power(daemon: &Daemon, server: Uuid, action: PowerAction) -> OpResult {
             daemon.ensure_server_port(server).await;
         }
         PowerAction::Stop | PowerAction::Kill => handle.stopping_on_purpose(),
+    }
+
+    if matches!(action, PowerAction::Start | PowerAction::Restart) {
+        // Контейнеру нужен его порт. Мастер снимает держатель сам, но если тот
+        // по какой-то причине остался, запуск упирался в занятый порт.
+        daemon.placeholders.remove(&server);
     }
 
     let result = match action {

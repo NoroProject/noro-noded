@@ -5,7 +5,8 @@
 //! консоли и чем занят каждый сервер. Отчёт отдаётся мастеру в ответе на
 //! `NodeInfo` и оператору машины — `curl localhost:<порт>/status`.
 
-use serde_json::{json, Value};
+use schema::noded::{MasterLink, NodeDiag, ServerDiag, SftpDiag};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -55,49 +56,57 @@ impl Health {
 /// Отчёт целиком. Только чтение памяти демона: докер и диск не трогаются,
 /// чтобы ответ приходил и тогда, когда завис именно докер.
 pub fn report(daemon: &Daemon) -> Value {
+    serde_json::to_value(diag(daemon)).unwrap_or(Value::Null)
+}
+
+fn diag(daemon: &Daemon) -> NodeDiag {
     let health = &daemon.health;
     let last_contact = health.last_contact.load(Ordering::Relaxed);
     let busy: std::collections::HashMap<_, _> = daemon.busy.snapshot().into_iter().collect();
 
-    let mut servers: Vec<Value> = daemon
+    let mut servers: Vec<ServerDiag> = daemon
         .registry
         .ids()
         .into_iter()
         .filter_map(|id| {
             let handle = daemon.registry.get(id)?;
             let state = handle.state();
-            Some(json!({
-                "id": id,
-                "power": state.power,
-                "ready": state.ready,
-                "stopped_on_purpose": state.stopped_on_purpose,
-                "restarts": state.restarts,
+            Some(ServerDiag {
+                id,
+                power: state.power,
+                ready: state.ready,
+                stopped_on_purpose: state.stopped_on_purpose,
+                restarts: state.restarts,
                 // Занятый замок значит, что в консоль как раз пишут; это не
                 // «консоли нет».
-                "console": handle.writer.try_lock().map(|w| w.is_some()).unwrap_or(true),
-                "busy": busy.get(&id),
-                "sleeping": daemon.placeholders.contains_key(&id),
-            }))
+                console: handle
+                    .writer
+                    .try_lock()
+                    .map(|w| w.is_some())
+                    .unwrap_or(true),
+                busy: busy.get(&id).map(|what| what.to_string()),
+                sleeping: daemon.placeholders.contains_key(&id),
+            })
         })
         .collect();
-    servers.sort_by_key(|s| s["id"].as_str().unwrap_or_default().to_string());
+    servers.sort_by_key(|s| s.id);
 
-    json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime_secs": health.started.elapsed().as_secs(),
-        "master": {
-            "connected": health.connected.load(Ordering::Relaxed),
-            "last_contact": (last_contact > 0).then_some(last_contact),
-            "disconnects": health.disconnects.load(Ordering::Relaxed),
+    NodeDiag {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: health.started.elapsed().as_secs(),
+        master: MasterLink {
+            connected: health.connected.load(Ordering::Relaxed),
+            last_contact: (last_contact > 0).then_some(last_contact),
+            disconnects: health.disconnects.load(Ordering::Relaxed),
         },
-        "events_queued": daemon.events.max_capacity() - daemon.events.capacity(),
-        "console_lines_dropped": DROPPED_CONSOLE_LINES.load(Ordering::Relaxed),
-        "sftp": {
-            "enabled": daemon.cfg.sftp.enabled,
-            "fingerprint": daemon.sftp_fingerprint.lock().clone(),
+        events_queued: (daemon.events.max_capacity() - daemon.events.capacity()) as u64,
+        console_lines_dropped: DROPPED_CONSOLE_LINES.load(Ordering::Relaxed),
+        sftp: SftpDiag {
+            enabled: daemon.cfg.sftp.enabled,
+            fingerprint: daemon.sftp_fingerprint.lock().clone(),
         },
-        "servers": servers,
-    })
+        servers,
+    }
 }
 
 #[cfg(test)]

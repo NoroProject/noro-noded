@@ -45,6 +45,9 @@ fn heavy(op: &NodeOp) -> Option<(Uuid, &'static str)> {
         NodeOp::BuildSync { server, .. } => (server, "синхронизация сборки"),
         NodeOp::BackupCreate { server, .. } => (server, "бэкап"),
         NodeOp::BackupRestore { server, .. } => (server, "восстановление"),
+        // Удаление снимка — это сборка мусора в хранилище кусков, и идти
+        // поверх упаковки, которая пишет туда же, она не должна.
+        NodeOp::BackupDelete { server, .. } => (server, "удаление бэкапа"),
         NodeOp::ServerCloneFiles { server, .. } => (server, "клонирование"),
         _ => return None,
     };
@@ -162,7 +165,14 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             server,
             backup,
             download,
-        } => backup::restore(daemon, server, backup, download).await,
+            paths,
+        } => backup::restore(daemon, server, backup, download, paths).await,
+
+        NodeOp::BackupBrowse {
+            server,
+            backup,
+            path,
+        } => backup::browse(daemon, server, backup, path).await,
 
         NodeOp::BackupDelete { server, backup } => backup::delete(daemon, server, backup).await,
 

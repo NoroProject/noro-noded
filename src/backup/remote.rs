@@ -1,54 +1,31 @@
-// Файл превышает 150 строк: клиент S3-совместимого хранилища для выгрузки и скачивания бэкапов на ноде.
+// Файл превышает 150 строк: выгрузка архива, потоковая выгрузка снимка частями и скачивание обратно — одна связь с хранилищем.
 //! Выгрузка и скачивание бэкапов во внешние хранилища напрямую с ноды.
 //!
-//! Нода держит готовый архив на диске и сама отправляет его в S3/R2/MinIO,
-//! минуя мастер: гонять тяжёлый тарбол через мастер-сервер бессмысленно.
+//! Нода держит бэкап на диске и сама отправляет его в S3/R2/MinIO, минуя
+//! мастер: гонять тяжёлый тарбол через мастер-сервер бессмысленно.
+//!
+//! В хранилище бэкап всегда лежит собранным `.tar.gz` — и полный архив, и
+//! снимок из кусков. Хранилище — это то, из чего восстанавливают, когда ноды
+//! уже нет: архив там обязан открываться сам по себе, без нашего формата и
+//! без соседних объектов. Куски с дедупликацией в хранилище экономили бы
+//! место, но тогда удаление бэкапа превращается в сборку мусора по чужому
+//! бакету, а мастер, удаляющий объект бэкапа сам, этого не умеет.
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use hmac::{Hmac, Mac};
-use reqwest::Client;
+use futures_util::StreamExt;
+use reqwest::{Client, Method};
 use schema::noded::BackupUpload;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Debug, Clone, Deserialize)]
-struct S3Config {
-    #[serde(default = "default_endpoint")]
-    endpoint: String,
-    #[serde(default = "default_region")]
-    region: String,
-    bucket: String,
-    access_key: String,
-    secret_key: String,
-    #[serde(default)]
-    path_prefix: String,
-}
-
-fn default_endpoint() -> String {
-    "https://s3.amazonaws.com".into()
-}
-
-fn default_region() -> String {
-    "us-east-1".into()
-}
-
-impl S3Config {
-    fn full_key(&self, filename: &str) -> String {
-        let prefix = self.path_prefix.trim().trim_matches('/');
-        if prefix.is_empty() {
-            filename.trim_start_matches('/').to_string()
-        } else {
-            format!("{prefix}/{}", filename.trim_start_matches('/'))
-        }
-    }
-}
+use super::s3::{self, S3Config, EMPTY_SHA256};
 
 /// Сколько ждать хранилище, если оно не отвечает вовсе.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Часть потоковой выгрузки. S3 принимает не больше десяти тысяч частей:
+/// 32 МБ — это потолок в 320 ГБ на бэкап при 32 МБ памяти на выгрузку.
+const PART: usize = 32 * 1024 * 1024;
 
 /// Потолок на всю передачу: пятнадцать минут плюс секунда на каждый мегабайт.
 ///
@@ -65,23 +42,24 @@ fn client(bytes: u64) -> Result<Client> {
         .build()?)
 }
 
+fn s3_config(target: &BackupUpload) -> Result<S3Config> {
+    if target.kind != "s3" {
+        bail!("хранилище типа '{}' не поддерживается на ноде", target.kind);
+    }
+    serde_json::from_value(target.config.clone()).context("неверная конфигурация S3 хранилища")
+}
+
 /// Залить готовый архив во внешнее хранилище.
 ///
 /// Архив читается потоком: прежде он целиком ложился в память демона, и бэкап
 /// большого мира заканчивался тем, что ядро убивало демон вместе с консолями
 /// всех серверов ноды.
 pub async fn upload(archive: &Path, target: &BackupUpload) -> Result<()> {
-    if target.kind != "s3" {
-        bail!("хранилище типа '{}' не поддерживается на ноде", target.kind);
-    }
-    let cfg: S3Config = serde_json::from_value(target.config.clone())
-        .context("неверная конфигурация S3 хранилища")?;
+    let cfg = s3_config(target)?;
     let key = cfg.full_key(&target.path);
 
-    // Архив лежит в служебном каталоге сервера, и на его месте процесс
-    // сервера мог оставить ссылку на файл хоста — в чужое хранилище уехал бы
-    // он. Подпись S3 требует хеш тела заранее: он считается проходом по тому
-    // же открытому файлу, а не по пути.
+    // Архив открывается мимо ссылок. Подпись S3 требует хеш тела заранее: он
+    // считается проходом по тому же открытому файлу, а не по пути.
     let path = archive.to_path_buf();
     let (file, size, content_sha256) = tokio::task::spawn_blocking(move || -> Result<_> {
         use std::io::{Seek, SeekFrom};
@@ -96,12 +74,164 @@ pub async fn upload(archive: &Path, target: &BackupUpload) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("чтение архива не выполнено: {e}"))??;
 
     let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
-    let body = Body {
-        inner: reqwest::Body::wrap_stream(stream),
-        size,
-        sha256: content_sha256,
+    let req = s3::Request {
+        method: Method::PUT,
+        key: &key,
+        query: vec![],
+        headers: vec![("content-type", "application/octet-stream".into())],
+        payload_sha256: content_sha256,
     };
-    s3_put(&client(size)?, &cfg, &key, body).await
+    s3::send(
+        req.build(&client(size)?, &cfg)
+            .header("content-length", size)
+            .body(reqwest::Body::wrap_stream(stream)),
+        "PUT",
+    )
+    .await?;
+    Ok(())
+}
+
+/// Залить снимок собранным tar.gz — по частям, по мере сборки.
+///
+/// Длины архива заранее не знает никто, а обычная заливка требует и её, и
+/// хеш всего тела. Собирать его ради этого дважды — вдвое дольше, во
+/// временный файл — ещё один мир на диске. Многочастная заливка подписывает
+/// каждую часть отдельно, и в памяти лежит только текущая.
+pub async fn upload_snapshot(
+    repo: PathBuf,
+    backup: uuid::Uuid,
+    target: &BackupUpload,
+) -> Result<()> {
+    let cfg = s3_config(target)?;
+    let key = cfg.full_key(&target.path);
+    let http = client(PART as u64)?;
+
+    let created = s3::send(
+        s3::Request {
+            method: Method::POST,
+            key: &key,
+            query: vec![("uploads", String::new())],
+            headers: vec![("content-type", "application/gzip".into())],
+            payload_sha256: EMPTY_SHA256.into(),
+        }
+        .build(&http, &cfg),
+        "CreateMultipartUpload",
+    )
+    .await?
+    .text()
+    .await?;
+    let upload_id = xml_value(&created, "UploadId").context("хранилище не выдало UploadId")?;
+
+    let sent = send_parts(&http, &cfg, &key, &upload_id, repo, backup).await;
+    let completed = match sent {
+        Ok(etags) => complete(&http, &cfg, &key, &upload_id, &etags).await,
+        Err(e) => Err(e),
+    };
+    if completed.is_err() {
+        // Брошенная многочастная заливка лежит в бакете невидимо и стоит
+        // денег, пока её не отменят.
+        let abort = s3::Request {
+            method: Method::DELETE,
+            key: &key,
+            query: vec![("uploadId", upload_id.clone())],
+            headers: vec![],
+            payload_sha256: EMPTY_SHA256.into(),
+        };
+        let _ = s3::send(abort.build(&http, &cfg), "AbortMultipartUpload").await;
+    }
+    completed
+}
+
+async fn send_parts(
+    http: &Client,
+    cfg: &S3Config,
+    key: &str,
+    upload_id: &str,
+    repo: PathBuf,
+    backup: uuid::Uuid,
+) -> Result<Vec<String>> {
+    let mut stream = Box::pin(super::stream::tar_gz_stream(repo, backup));
+    let mut etags = Vec::new();
+    let mut part = Vec::with_capacity(PART);
+    let mut done = false;
+    while !done {
+        match stream.next().await {
+            Some(bytes) => part.extend_from_slice(&bytes?),
+            None => done = true,
+        }
+        // Последняя часть может быть любой длины, в том числе единственная.
+        if part.len() < PART && !(done && (!part.is_empty() || etags.is_empty())) {
+            continue;
+        }
+        let body = std::mem::replace(&mut part, Vec::with_capacity(PART));
+        let number = etags.len() + 1;
+        let req = s3::Request {
+            method: Method::PUT,
+            key,
+            query: vec![
+                ("partNumber", number.to_string()),
+                ("uploadId", upload_id.to_string()),
+            ],
+            headers: vec![],
+            payload_sha256: hex::encode(Sha256::digest(&body)),
+        };
+        let res = s3::send(
+            req.build(http, cfg)
+                .header("content-length", body.len())
+                .body(body),
+            "UploadPart",
+        )
+        .await?;
+        let etag = res
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .context("хранилище не вернуло ETag части")?;
+        etags.push(etag.to_string());
+    }
+    Ok(etags)
+}
+
+async fn complete(
+    http: &Client,
+    cfg: &S3Config,
+    key: &str,
+    upload_id: &str,
+    etags: &[String],
+) -> Result<()> {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for (i, etag) in etags.iter().enumerate() {
+        body.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{etag}</ETag></Part>",
+            i + 1
+        ));
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    let req = s3::Request {
+        method: Method::POST,
+        key,
+        query: vec![("uploadId", upload_id.to_string())],
+        headers: vec![("content-type", "application/xml".into())],
+        payload_sha256: hex::encode(Sha256::digest(body.as_bytes())),
+    };
+    let text = s3::send(req.build(http, cfg).body(body), "CompleteMultipartUpload")
+        .await?
+        .text()
+        .await?;
+    // S3 умеет ответить 200 и ошибкой в теле, если сборка частей сорвалась
+    // уже после того, как ответ начался.
+    if text.contains("<Error>") {
+        bail!("S3 CompleteMultipartUpload: {text}");
+    }
+    Ok(())
+}
+
+/// Значение первого тега `<name>` в ответе S3.
+fn xml_value(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = xml.find(&open)? + open.len();
+    let len = xml[start..].find(&format!("</{name}>"))?;
+    Some(xml[start..start + len].to_string())
 }
 
 /// Скачать архив из внешнего хранилища перед восстановлением.
@@ -110,14 +240,9 @@ pub async fn upload(archive: &Path, target: &BackupUpload) -> Result<()> {
 /// помещается, а оборванное скачивание не должно оставлять огрызок под именем
 /// настоящего архива.
 pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
-    use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    if source.kind != "s3" {
-        bail!("хранилище типа '{}' не поддерживается на ноде", source.kind);
-    }
-    let cfg: S3Config = serde_json::from_value(source.config.clone())
-        .context("неверная конфигурация S3 хранилища")?;
+    let cfg = s3_config(source)?;
     let key = cfg.full_key(&source.path);
 
     let (Some(parent), Some(name)) = (archive.parent(), archive.file_name()) else {
@@ -134,7 +259,14 @@ pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
     };
 
     // Размер заранее неизвестен — потолок по самому большому разумному миру.
-    let response = s3_get(&client(64 * 1024 * 1024 * 1024)?, &cfg, &key).await?;
+    let req = s3::Request {
+        method: Method::GET,
+        key: &key,
+        query: vec![],
+        headers: vec![],
+        payload_sha256: EMPTY_SHA256.into(),
+    };
+    let response = s3::send(req.build(&client(64 * 1024 * 1024 * 1024)?, &cfg), "GET").await?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -162,140 +294,14 @@ pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
     renamed.context("ошибка скачивания из S3")
 }
 
-/// Тело заливки: поток и то, что подписи нужно знать о нём заранее.
-struct Body {
-    inner: reqwest::Body,
-    size: u64,
-    sha256: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn s3_put(client: &Client, cfg: &S3Config, key: &str, body: Body) -> Result<()> {
-    let now = Utc::now();
-    let date = now.format("%Y%m%d").to_string();
-    let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
-
-    let host = endpoint_host(&cfg.endpoint);
-    let path = format!("/{}/{}", cfg.bucket, key.trim_start_matches('/'));
-    let content_sha256 = body.sha256;
-    let content_type = "application/octet-stream";
-
-    let canonical_headers = format!(
-        "content-type:{content_type}\nhost:{host}\nx-amz-content-sha256:{content_sha256}\nx-amz-date:{datetime}\n"
-    );
-    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date";
-
-    let canonical_request =
-        format!("PUT\n{path}\n\n{canonical_headers}\n{signed_headers}\n{content_sha256}");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{datetime}\n{date}/{}/{}/aws4_request\n{}",
-        cfg.region,
-        "s3",
-        hex::encode(Sha256::digest(canonical_request.as_bytes()))
-    );
-
-    let signing_key = derive_signing_key(&cfg.secret_key, &date, &cfg.region);
-    let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
-    mac.update(string_to_sign.as_bytes());
-    let signature = hex::encode(mac.finalize().into_bytes());
-
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request,SignedHeaders={signed_headers},Signature={signature}",
-        cfg.access_key, date, cfg.region
-    );
-
-    let url = format!("{}/{}", cfg.endpoint.trim_end_matches('/'), &path[1..]);
-    let res = client
-        .put(&url)
-        .header("host", &host)
-        .header("content-type", content_type)
-        .header("x-amz-content-sha256", &content_sha256)
-        .header("x-amz-date", &datetime)
-        .header("authorization", &authorization)
-        .header("content-length", body.size)
-        .body(body.inner)
-        .send()
-        .await
-        .context("ошибка отправки запроса в S3")?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        bail!("S3 PUT ошибка {status}: {body}");
+    #[test]
+    fn the_upload_id_is_read_from_the_reply() {
+        let xml = r#"<?xml version="1.0"?><InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>VXBsb2Fk.ID</UploadId></InitiateMultipartUploadResult>"#;
+        assert_eq!(xml_value(xml, "UploadId").as_deref(), Some("VXBsb2Fk.ID"));
+        assert_eq!(xml_value(xml, "Missing"), None);
     }
-    Ok(())
-}
-
-async fn s3_get(client: &Client, cfg: &S3Config, key: &str) -> Result<reqwest::Response> {
-    let now = Utc::now();
-    let date = now.format("%Y%m%d").to_string();
-    let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
-
-    let host = endpoint_host(&cfg.endpoint);
-    let path = format!("/{}/{}", cfg.bucket, key.trim_start_matches('/'));
-    let content_sha256 = hex::encode(Sha256::digest(b""));
-
-    let canonical_headers =
-        format!("host:{host}\nx-amz-content-sha256:{content_sha256}\nx-amz-date:{datetime}\n");
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-
-    let canonical_request =
-        format!("GET\n{path}\n\n{canonical_headers}\n{signed_headers}\n{content_sha256}");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{datetime}\n{date}/{}/{}/aws4_request\n{}",
-        cfg.region,
-        "s3",
-        hex::encode(Sha256::digest(canonical_request.as_bytes()))
-    );
-
-    let signing_key = derive_signing_key(&cfg.secret_key, &date, &cfg.region);
-    let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
-    mac.update(string_to_sign.as_bytes());
-    let signature = hex::encode(mac.finalize().into_bytes());
-
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request,SignedHeaders={signed_headers},Signature={signature}",
-        cfg.access_key, date, cfg.region
-    );
-
-    let url = format!("{}/{}", cfg.endpoint.trim_end_matches('/'), &path[1..]);
-    let res = client
-        .get(&url)
-        .header("host", &host)
-        .header("x-amz-content-sha256", &content_sha256)
-        .header("x-amz-date", &datetime)
-        .header("authorization", &authorization)
-        .send()
-        .await
-        .context("ошибка скачивания из S3")?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        bail!("S3 GET ошибка {status}: {body}");
-    }
-    Ok(res)
-}
-
-fn endpoint_host(endpoint: &str) -> String {
-    endpoint
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn derive_signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8> {
-    let k_secret = format!("AWS4{secret_key}");
-    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, b"s3");
-    hmac_sha256(&k_service, b"aws4_request")
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
 }

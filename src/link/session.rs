@@ -208,7 +208,10 @@ async fn hello(daemon: &Daemon) -> Result<FromNode> {
     let servers = daemon.engine.snapshot().await.unwrap_or_default();
     let machine = crate::metrics::machine(&daemon.cfg.data_dir);
 
-    let mut capabilities = vec![caps::IMAGE_PULL.to_string()];
+    let mut capabilities = vec![
+        caps::IMAGE_PULL.to_string(),
+        caps::BACKUP_PARTIAL.to_string(),
+    ];
     if daemon.cfg.http.public_url.is_some() {
         capabilities.push(caps::DIRECT_TRANSFER.to_string());
     }

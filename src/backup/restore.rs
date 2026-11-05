@@ -8,17 +8,30 @@
 
 use anyhow::{bail, Result};
 use flate2::read::GzDecoder;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
+use super::repo::Repo;
+use super::stream::ChunkReader;
 use crate::docker::Engine;
 use crate::server::registry::Registry;
 
+/// Из чего восстанавливать.
+pub enum Source {
+    /// Полный `.tar.gz`: прежние бэкапы и скачанные из хранилища.
+    Archive(PathBuf),
+    /// Снимок в хранилище кусков.
+    Snapshot { repo: PathBuf, backup: uuid::Uuid },
+}
+
+/// Восстановить сервер. `paths` — только эти файлы и каталоги; пусто — всё.
 pub async fn restore(
     engine: &Engine,
     registry: &Registry,
     server: uuid::Uuid,
     root: &Path,
-    archive: &Path,
+    source: Source,
+    paths: Vec<String>,
 ) -> Result<()> {
     if let Some(handle) = registry.get(server) {
         if handle.state().power.is_up() {
@@ -33,25 +46,60 @@ pub async fn restore(
         }
     }
 
-    if std::fs::symlink_metadata(archive).is_err() {
-        bail!("архива нет на этой ноде");
-    }
-
     // Распаковка тоже блокирующая и тоже на гигабайты — на рабочем потоке
     // рантайма она заморозила бы всю ноду, а не только этот сервер.
-    let (root, archive) = (root.to_path_buf(), archive.to_path_buf());
-    tokio::task::spawn_blocking(move || unpack_into(&root, &archive))
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || unpack_into(&root, &source, &Filter::new(&paths)))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("распаковка не выполнена: {e}")))
 }
 
-fn unpack_into(root: &Path, archive: &Path) -> Result<()> {
-    unpack_files(root, archive)?;
+fn unpack_into(root: &Path, source: &Source, filter: &Filter) -> Result<()> {
+    match source {
+        Source::Archive(archive) => {
+            if std::fs::symlink_metadata(archive).is_err() {
+                bail!("архива нет на этой ноде");
+            }
+            unpack_files(root, archive, filter)?
+        }
+        Source::Snapshot { repo, backup } => {
+            unpack_snapshot(root, &Repo::at(repo), *backup, filter)?
+        }
+    }
     crate::server::layout::chown_recursive(root)?;
     Ok(())
 }
 
-fn unpack_files(root: &Path, archive: &Path) -> Result<()> {
+/// Какие пути восстанавливать: сам путь и всё под ним.
+pub(super) struct Filter(Vec<String>);
+
+impl Filter {
+    pub fn new(paths: &[String]) -> Self {
+        Self(
+            paths
+                .iter()
+                .map(|p| p.trim_matches('/').trim_start_matches("./").to_string())
+                .filter(|p| !p.is_empty() && p != ".")
+                .collect(),
+        )
+    }
+
+    /// Пусто — восстанавливается весь бэкап.
+    pub fn is_all(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn wants(&self, rel: &str) -> bool {
+        let rel = rel.trim_end_matches('/');
+        self.0.is_empty()
+            || self.0.iter().any(|p| {
+                rel == p
+                    || (rel.starts_with(p.as_str()) && rel.as_bytes().get(p.len()) == Some(&b'/'))
+            })
+    }
+}
+
+fn unpack_files(root: &Path, archive: &Path, filter: &Filter) -> Result<()> {
     // Архив мог приехать из хранилища или от прежней раскладки, когда он
     // лежал в папке сервера: открывается он так же, как любой файл сервера.
     let file = crate::fs::nofollow::open_existing(archive, false)?;
@@ -60,6 +108,7 @@ fn unpack_files(root: &Path, archive: &Path) -> Result<()> {
     // Распаковываем поверх: файлы, которых в архиве нет, остаются. Стирать
     // каталог целиком опаснее — в нём могут быть вещи, появившиеся после
     // бэкапа, и владелец ждёт «вернуть мир», а не «снести всё».
+    let mut placed = 0usize;
     for entry in tar.entries()? {
         let mut entry = entry?;
         let kind = entry.header().entry_type();
@@ -71,35 +120,111 @@ fn unpack_files(root: &Path, archive: &Path) -> Result<()> {
             continue;
         }
         let rel = entry.path()?.to_string_lossy().replace('\\', "/");
-
-        // Путь из архива — такие же чужие данные, как путь из запроса.
-        let Ok(target) = crate::fs::resolve(root, &rel) else {
-            tracing::warn!(path = %rel, "путь из архива выходит за каталог сервера");
+        if !filter.wants(&rel) {
             continue;
-        };
+        }
+        let mode = entry.header().mode().ok();
+        let mtime = entry.header().mtime().ok();
         if kind.is_dir() {
-            crate::fs::mkdir::create_dir_all(root, &target)?;
-            continue;
+            place_dir(root, &rel)?;
+        } else {
+            place_file(root, &rel, &mut entry, mode, mtime)?;
         }
-        if let Some(parent) = target.parent() {
-            crate::fs::mkdir::create_dir_all(root, parent)?;
-        }
-        let mut out = crate::fs::nofollow::create_replacing(&target)?;
-        std::io::copy(&mut entry, &mut out)?;
-        keep_metadata(&out, entry.header());
+        placed += 1;
+    }
+    nothing_found(filter, placed)
+}
+
+/// Выборочное восстановление, не нашедшее ни одного пути, — это опечатка в
+/// пути, а не успех: владелец иначе решит, что файл вернулся.
+fn nothing_found(filter: &Filter, placed: usize) -> Result<()> {
+    if placed == 0 && !filter.is_all() {
+        bail!("в бэкапе нет такого пути");
     }
     Ok(())
 }
 
-/// Права и время изменения из архива. Без прав скрипт запуска из бэкапа
+pub(super) fn unpack_snapshot(
+    root: &Path,
+    repo: &Repo,
+    backup: uuid::Uuid,
+    filter: &Filter,
+) -> Result<()> {
+    let manifest = repo.manifest(backup)?;
+    let wanted: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|e| filter.wants(&e.path))
+        .collect();
+    nothing_found(filter, wanted.len())?;
+    // Все куски на месте — до первой записи в папку сервера: оборваться на
+    // середине из-за пропавшего куска значит оставить мир наполовину старым.
+    if let Some(lost) = wanted
+        .iter()
+        .flat_map(|e| e.chunks.iter())
+        .find(|c| !repo.has_chunk(&c.id))
+    {
+        bail!("в хранилище нет куска {:?} — снимок неполон", lost.id);
+    }
+    for entry in wanted {
+        if entry.dir {
+            place_dir(root, &entry.path)?;
+            continue;
+        }
+        let mut body = ChunkReader::new(repo, entry);
+        place_file(
+            root,
+            &entry.path,
+            &mut body,
+            Some(entry.mode),
+            Some(entry.mtime.max(0) as u64),
+        )?;
+    }
+    Ok(())
+}
+
+/// Путь из бэкапа — такие же чужие данные, как путь из запроса: архив мог
+/// приехать из хранилища, а снимок — лечь на диск чужими руками.
+fn place_dir(root: &Path, rel: &str) -> Result<()> {
+    let Ok(target) = crate::fs::resolve(root, rel) else {
+        tracing::warn!(path = %rel, "путь из бэкапа выходит за каталог сервера");
+        return Ok(());
+    };
+    crate::fs::mkdir::create_dir_all(root, &target)?;
+    Ok(())
+}
+
+fn place_file(
+    root: &Path,
+    rel: &str,
+    body: &mut impl Read,
+    mode: Option<u32>,
+    mtime: Option<u64>,
+) -> Result<()> {
+    let Ok(target) = crate::fs::resolve(root, rel) else {
+        tracing::warn!(path = %rel, "путь из бэкапа выходит за каталог сервера");
+        return Ok(());
+    };
+    if let Some(parent) = target.parent() {
+        crate::fs::mkdir::create_dir_all(root, parent)?;
+    }
+    let mut out = crate::fs::nofollow::create_replacing(&target)?;
+    std::io::copy(body, &mut out)?;
+    keep_metadata(&out, mode, mtime);
+    Ok(())
+}
+
+/// Права и время изменения из бэкапа. Без прав скрипт запуска из бэкапа
 /// перестаёт быть исполняемым; setuid и прочие старшие биты не переносятся.
-fn keep_metadata(file: &std::fs::File, header: &tar::Header) {
+fn keep_metadata(file: &std::fs::File, mode: Option<u32>, mtime: Option<u64>) {
     #[cfg(unix)]
-    if let Ok(mode) = header.mode() {
+    if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
         let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777));
     }
-    if let Ok(mtime) = header.mtime() {
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Some(mtime) = mtime {
         let _ = file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime));
     }
 }
@@ -148,7 +273,7 @@ mod tests {
             }
         });
 
-        unpack_files(&root, &tgz).unwrap();
+        unpack_files(&root, &tgz, &Filter::new(&[])).unwrap();
 
         assert_eq!(std::fs::read(root.join("world/level.dat")).unwrap(), b"lvl");
         assert!(std::fs::symlink_metadata(root.join("Link.txt")).is_err());

@@ -1,21 +1,24 @@
-//! Бэкапы: упаковка, восстановление, удаление, выдача на скачивание.
+// Файл превышает 150 строк: все операции бэкапа сервера — упаковка, восстановление, удаление, просмотр и выдача — над одним каталогом.
+//! Бэкапы: упаковка, восстановление, удаление, просмотр, выдача на скачивание.
 
-use schema::noded::{BackupUpload, OpError, TicketMode};
-use serde_json::{json, Value};
+use schema::noded::{BackupDeleted, BackupFormat, BackupInfo, BackupUpload, OpError, TicketMode};
+use serde_json::Value;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::files::grant;
 use super::{blocking, OpResult};
-use crate::backup::create::OverBudget;
-use crate::backup::store;
+use crate::backup::create::{OverBudget, Target as PackTarget};
+use crate::backup::repo::Repo;
+use crate::backup::restore::Source;
+use crate::backup::store::{self, Kept};
 use crate::fs;
 use crate::http::tickets::Target;
 use crate::Daemon;
 
 const MIB: u64 = 1024 * 1024;
 
-/// Каталог архивов сервера — созданный, сверенный и с перенесёнными из
+/// Каталог бэкапов сервера — созданный, сверенный и с перенесёнными из
 /// прежнего места архивами.
 async fn backup_dir(daemon: &Daemon, server: Uuid) -> Result<PathBuf, OpError> {
     let dir = daemon.cfg.backup_dir(server);
@@ -25,6 +28,13 @@ async fn backup_dir(daemon: &Daemon, server: Uuid) -> Result<PathBuf, OpError> {
         .await
         .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
     Ok(dir)
+}
+
+async fn usage(dir: &std::path::Path) -> u64 {
+    let measured = dir.to_path_buf();
+    blocking(move || Ok(store::usage(&measured)))
+        .await
+        .unwrap_or(0)
 }
 
 pub async fn create(
@@ -44,10 +54,7 @@ pub async fn create(
         .node_fits(0)
         .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
 
-    let measured = dir.clone();
-    let used = blocking(move || Ok(store::usage(&measured)))
-        .await
-        .unwrap_or(0);
+    let used = usage(&dir).await;
     let quota = quota_mb.saturating_mul(MIB);
     if quota > 0 && used >= quota {
         return Err(quota_refusal(used, quota));
@@ -59,8 +66,21 @@ pub async fn create(
         (a, b) => a.or(b),
     };
 
-    let dest = store::archive_path(&dir, backup);
-    let r = crate::backup::create::create(&daemon.registry, &root, &dest, &ignore, limit)
+    let (target, format) = if daemon.cfg.backups.incremental {
+        (
+            PackTarget::Snapshot {
+                repo: dir.clone(),
+                backup,
+            },
+            BackupFormat::Chunks,
+        )
+    } else {
+        (
+            PackTarget::Archive(store::archive_path(&dir, backup)),
+            BackupFormat::Tar,
+        )
+    };
+    let r = crate::backup::create::create(&daemon.registry, &root, target, &ignore, limit)
         .await
         .map_err(|e| match e.downcast_ref::<OverBudget>() {
             // Упёрлись в то из двух, что меньше: его и называем.
@@ -72,23 +92,38 @@ pub async fn create(
         })?;
     daemon.quota.node_consume(r.bytes);
 
-    if let Some(target) = upload {
-        crate::backup::remote::upload(&dest, &target)
-            .await
-            .map_err(|e| {
-                OpError::new(
-                    "upstream_failed",
-                    format!("заливка в хранилище не удалась: {e:#}"),
-                )
-            })?;
+    if let Some(target) = &upload {
+        let pushed = match format {
+            BackupFormat::Tar => {
+                crate::backup::remote::upload(&store::archive_path(&dir, backup), target).await
+            }
+            BackupFormat::Chunks => {
+                crate::backup::remote::upload_snapshot(dir.clone(), backup, target).await
+            }
+        };
+        pushed.map_err(|e| {
+            OpError::new(
+                "upstream_failed",
+                format!("заливка в хранилище не удалась: {e:#}"),
+            )
+        })?;
     }
 
-    Ok(json!({
-        "backup": backup,
-        "bytes": r.bytes,
-        "sha256": r.sha256,
-        "backups_bytes": used + r.bytes,
+    Ok(reply(&BackupInfo {
+        backup,
+        bytes: r.bytes,
+        sha256: r.sha256,
+        storage_path: upload.map(|u| u.path),
+        format,
+        source_bytes: r.source_bytes,
+        // Замер заново, а не `used + bytes`: упаковка снимка могла и убрать
+        // куски, брошенные прошлой оборванной упаковкой.
+        backups_bytes: Some(usage(&dir).await),
     }))
+}
+
+fn reply(value: &impl serde::Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
 fn quota_refusal(used: u64, quota: u64) -> OpError {
@@ -107,38 +142,66 @@ pub async fn restore(
     server: Uuid,
     backup: Uuid,
     download: Option<Box<BackupUpload>>,
+    paths: Vec<String>,
 ) -> OpResult {
     let root = daemon.cfg.server_dir(server);
-    let archive = store::archive_path(&backup_dir(daemon, server).await?, backup);
-    if std::fs::symlink_metadata(&archive).is_err() {
-        if let Some(source) = download {
-            crate::backup::remote::download(&archive, &source)
-                .await
-                .map_err(|e| {
-                    OpError::new(
-                        "upstream_failed",
-                        format!("загрузка из хранилища не удалась: {e:#}"),
-                    )
-                })?;
+    let dir = backup_dir(daemon, server).await?;
+    let source = match store::find(&dir, backup) {
+        Kept::Archive(path) => Source::Archive(path),
+        Kept::Snapshot => Source::Snapshot { repo: dir, backup },
+        // В хранилище бэкап лежит собранным архивом при любом виде на ноде.
+        Kept::Missing => {
+            let archive = store::archive_path(&dir, backup);
+            if let Some(source) = download {
+                crate::backup::remote::download(&archive, &source)
+                    .await
+                    .map_err(|e| {
+                        OpError::new(
+                            "upstream_failed",
+                            format!("загрузка из хранилища не удалась: {e:#}"),
+                        )
+                    })?;
+            }
+            Source::Archive(archive)
         }
-    }
-    crate::backup::restore::restore(&daemon.engine, &daemon.registry, server, &root, &archive)
-        .await
-        .map(|_| Value::Null)
-        .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))
+    };
+    crate::backup::restore::restore(
+        &daemon.engine,
+        &daemon.registry,
+        server,
+        &root,
+        source,
+        paths,
+    )
+    .await
+    .map(|_| Value::Null)
+    .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))
 }
 
 pub async fn delete(daemon: &Daemon, server: Uuid, backup: Uuid) -> OpResult {
-    let archive = store::archive_path(&backup_dir(daemon, server).await?, backup);
-    if std::fs::symlink_metadata(&archive).is_ok() {
-        fs::nofollow::remove(&archive).map_err(|e| OpError::new("docker_failed", e.to_string()))?;
-    }
-    Ok(Value::Null)
+    let dir = backup_dir(daemon, server).await?;
+    let measured = dir.clone();
+    blocking(move || {
+        if let Kept::Archive(archive) = store::find(&dir, backup) {
+            fs::nofollow::remove(&archive)?;
+        }
+        let repo = Repo::at(&dir);
+        if repo.remove_snapshot(backup)? {
+            let done = crate::backup::gc::collect(&repo)?;
+            tracing::info!(%server, %backup, removed = done.removed, freed = done.freed, "снимок удалён");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
+    Ok(reply(&BackupDeleted {
+        backups_bytes: Some(usage(&measured).await),
+    }))
 }
 
 pub async fn ticket(daemon: &Daemon, server: Uuid, backup: Uuid, ttl_secs: u64) -> OpResult {
-    let archive = store::archive_path(&backup_dir(daemon, server).await?, backup);
-    if std::fs::symlink_metadata(&archive).is_err() {
+    let dir = backup_dir(daemon, server).await?;
+    if matches!(store::find(&dir, backup), Kept::Missing) {
         return Err(OpError::new("not_found", "бэкапа нет на ноде"));
     }
     Ok(grant(
@@ -149,4 +212,27 @@ pub async fn ticket(daemon: &Daemon, server: Uuid, backup: Uuid, ttl_secs: u64) 
         format!("{backup}.tar.gz"),
         ttl_secs,
     ))
+}
+
+pub async fn browse(daemon: &Daemon, server: Uuid, backup: Uuid, path: String) -> OpResult {
+    let dir = backup_dir(daemon, server).await?;
+    match store::find(&dir, backup) {
+        Kept::Snapshot => {}
+        // Заглянуть в tar.gz можно, только распаковав его целиком, — для
+        // мира это минуты ради одного списка.
+        Kept::Archive(_) => {
+            return Err(OpError::new(
+                "panel_backup_not_browsable",
+                "полный архив не просматривается",
+            ))
+        }
+        Kept::Missing => return Err(OpError::new("not_found", "бэкапа нет на ноде")),
+    }
+    blocking(move || {
+        let manifest = Repo::at(&dir).manifest(backup)?;
+        Ok(crate::backup::browse::list(&manifest, &path))
+    })
+    .await
+    .map(|listing| reply(&listing))
+    .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))
 }

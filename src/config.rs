@@ -31,6 +31,27 @@ pub struct Config {
     /// работающим серверам было куда сохраняться. Ноль — запаса нет.
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
+    #[serde(default)]
+    pub backups: BackupsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupsConfig {
+    /// Снимать бэкапы снимками в хранилище кусков. `false` возвращает полные
+    /// `.tar.gz` — путь отката, если с хранилищем что-то не так; уже снятые
+    /// снимки при этом восстанавливаются и скачиваются как прежде.
+    #[serde(default = "default_true")]
+    pub incremental: bool,
+}
+
+impl Default for BackupsConfig {
+    fn default() -> Self {
+        Self { incremental: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +204,7 @@ mod tests {
             http: HttpConfig::default(),
             sftp: SftpConfig::default(),
             disk_reserve_mb: default_disk_reserve_mb(),
+            backups: BackupsConfig::default(),
         }
     }
 

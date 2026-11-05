@@ -1,5 +1,5 @@
 // Файл превышает 150 строк: тишина сервера на время упаковки, сама упаковка и её проверки — одна операция бэкапа.
-//! Упаковка сервера в архив.
+//! Упаковка сервера: полным архивом или снимком в хранилище кусков.
 //!
 //! Живой мир нельзя просто затарить: Minecraft держит регионы открытыми и
 //! пишет в них когда захочет, и половина архива окажется от состояния «до», а
@@ -11,7 +11,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::Digest;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +29,23 @@ const FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// Логи — потому что их десятки гигабайт и они бесполезны в восстановлении;
 /// `.noro` — потому что там секрет агента, и ему незачем уезжать в чужое
 /// хранилище вместе с миром.
-const NEVER: &[&str] = &["logs", "crash-reports", ".noro", "backups"];
+pub(super) const NEVER: &[&str] = &["logs", "crash-reports", ".noro", "backups"];
 
 #[derive(Debug)]
 pub struct BackupResult {
+    /// Сколько байт бэкап добавил на диск: архив целиком или новые куски.
     pub bytes: u64,
     pub sha256: String,
+    /// Размер файлов в снимке; у архива неизвестен.
+    pub source_bytes: Option<u64>,
+}
+
+/// Куда упаковывать.
+pub enum Target {
+    /// Полный `.tar.gz` по этому пути.
+    Archive(PathBuf),
+    /// Снимок в хранилище кусков сервера.
+    Snapshot { repo: PathBuf, backup: uuid::Uuid },
 }
 
 /// Архив перерос отведённое ему место — лимит бэкапов сервера или запас диска
@@ -63,18 +74,24 @@ impl std::error::Error for OverBudget {}
 pub async fn create(
     registry: &Registry,
     root: &Path,
-    dest: &Path,
+    target: Target,
     ignore: &[String],
     limit: Option<u64>,
 ) -> Result<BackupResult> {
     let quiesced = quiesce(registry, root).await;
 
-    // Упаковка мира — это gzip поверх гигабайтов: на рабочем потоке рантайма
+    // Упаковка мира — это сжатие гигабайтов: на рабочем потоке рантайма
     // она останавливает консоли всех серверов ноды на всё время бэкапа.
-    let (src, dst, ignore) = (root.to_path_buf(), dest.to_path_buf(), ignore.to_vec());
-    let result = tokio::task::spawn_blocking(move || pack(&src, &dst, &ignore, limit))
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("упаковка не выполнена: {e}")));
+    let (src, ignore) = (root.to_path_buf(), ignore.to_vec());
+    let result = tokio::task::spawn_blocking(move || match target {
+        Target::Archive(dst) => pack(&src, &dst, &ignore, limit),
+        Target::Snapshot { repo, backup } => {
+            let repo = super::repo::Repo::open(&repo)?;
+            super::snapshot::take(&src, &repo, backup, &ignore, limit)
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("упаковка не выполнена: {e}")));
 
     if quiesced {
         // Отпускаем сервер даже если упаковка провалилась: иначе он останется
@@ -152,6 +169,12 @@ fn pack(root: &Path, dest: &Path, ignore: &[String], limit: Option<u64>) -> Resu
     result
 }
 
+/// Полный архив без тишины сервера — для замеров в тестах снимков.
+#[cfg(test)]
+pub(super) fn pack_for_test(root: &Path, dest: &Path) -> u64 {
+    pack(root, dest, &[], None).unwrap().bytes
+}
+
 fn write_archive(
     root: &Path,
     file: std::fs::File,
@@ -211,6 +234,7 @@ fn write_archive(
     Ok(BackupResult {
         bytes: sink.bytes,
         sha256: hex::encode(sink.hasher.finalize()),
+        source_bytes: None,
     })
 }
 
@@ -245,7 +269,7 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
-fn skipped(rel: &str, ignore: &[String]) -> bool {
+pub(super) fn skipped(rel: &str, ignore: &[String]) -> bool {
     let head = rel.split('/').next().unwrap_or("");
     if NEVER.contains(&head) {
         return true;

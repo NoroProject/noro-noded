@@ -7,20 +7,51 @@
 use dashmap::DashMap;
 use rand::Rng;
 use schema::noded::TicketMode;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// На что выписан тикет.
+///
+/// Хранится имя, а не готовый путь на диске: путь разрешается заново в момент
+/// передачи. Между выдачей и передачей проходят минуты, и путь, проверенный
+/// при выдаче, к этому времени мог вести через ссылку, подложенную процессом
+/// сервера, — в каталог хоста или в чужой сервер.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Файл сервера по относительному пути.
+    File(String),
+    /// Архив бэкапа в служебном каталоге: файловому менеджеру он недоступен.
+    Backup(Uuid),
+}
+
 #[derive(Clone)]
 pub struct Ticket {
     pub server: Uuid,
-    /// Абсолютный путь, уже разрешённый внутри каталога сервера.
-    pub path: PathBuf,
+    pub target: Target,
     pub mode: TicketMode,
     /// Имя, под которым файл уедет в браузер.
     pub filename: String,
     expires: Instant,
+}
+
+impl Ticket {
+    /// Разрешить путь тикета внутри каталога сервера — сейчас, а не при выдаче.
+    pub fn path(&self, root: &Path) -> anyhow::Result<PathBuf> {
+        match &self.target {
+            Target::File(rel) => {
+                if crate::fs::is_hidden(rel) {
+                    anyhow::bail!("служебный каталог");
+                }
+                Ok(match self.mode {
+                    TicketMode::Download => crate::fs::resolve_existing(root, rel)?,
+                    TicketMode::Upload => crate::fs::resolve(root, rel)?,
+                })
+            }
+            Target::Backup(backup) => Ok(crate::backup::archive_path(root, *backup)),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -34,7 +65,7 @@ impl Tickets {
     pub fn issue(
         &self,
         server: Uuid,
-        path: PathBuf,
+        target: Target,
         mode: TicketMode,
         filename: String,
         ttl_secs: u64,
@@ -49,7 +80,7 @@ impl Tickets {
             token.clone(),
             Ticket {
                 server,
-                path,
+                target,
                 mode,
                 filename,
                 expires: Instant::now() + ttl,

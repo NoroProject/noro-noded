@@ -99,9 +99,15 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
         return (StatusCode::METHOD_NOT_ALLOWED, "ticket is for upload").into_response();
     }
 
-    // Путь разрешён при выдаче тикета, а за минуты до скачивания процесс
-    // сервера мог положить на его место ссылку на файл хоста.
-    let file = match crate::fs::nofollow::open_existing(&ticket.path, false) {
+    // Путь проверен при выдаче тикета, но за минуты до скачивания процесс
+    // сервера мог положить на его место или на место каталога над ним ссылку
+    // на файл хоста. Поэтому он разрешается заново, и открывается без ссылок.
+    let root = daemon.cfg.server_dir(ticket.server);
+    let path = match ticket.path(&root) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    };
+    let file = match crate::fs::nofollow::open_existing(&path, false) {
         Ok(f) => tokio::fs::File::from_std(f),
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
@@ -145,6 +151,10 @@ async fn upload(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let root = daemon.cfg.server_dir(ticket.server);
+    let path = match ticket.path(&root) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    };
     // Замер снимается один раз на всю заливку. Прежде предел сверялся на
     // каждый пришедший кусок, и как только клиент врал про длину, каждый из
     // них норовил заново обойти каталог сервера целиком.
@@ -153,7 +163,7 @@ async fn upload(
         return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
     }
 
-    let (Some(parent), Some(name)) = (ticket.path.parent(), ticket.path.file_name()) else {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return (StatusCode::BAD_REQUEST, "no file name").into_response();
     };
     if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -225,7 +235,7 @@ async fn upload(
     }
 
     // Файл лёг от имени демона, а внутри контейнера сервер ходит другим uid.
-    if let Err(e) = crate::server::layout::chown_path(&ticket.path) {
+    if let Err(e) = crate::server::layout::chown_path(&path) {
         tracing::warn!(server = %ticket.server, error = %e, "залитый файл остался с чужим владельцем");
     }
     daemon.quota.add(ticket.server, written);

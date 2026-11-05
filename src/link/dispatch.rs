@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::docker::{create::CreateArgs, Engine};
 use crate::fs;
+use crate::http::tickets::Target;
 use crate::server::{install, layout::Layout, registry::Registry, supervisor};
 use crate::Daemon;
 
@@ -532,7 +533,9 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             ttl_secs,
         } => {
             let root = daemon.cfg.server_dir(server);
-            let resolved = match mode {
+            // Проверка сейчас — чтобы панель сразу сказала «нет такого файла»;
+            // при самой передаче путь разрешается ещё раз.
+            match mode {
                 TicketMode::Download => fs::resolve_existing(&root, &path),
                 TicketMode::Upload => fs::resolve(&root, &path),
             }
@@ -545,7 +548,14 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".into());
-            Ok(grant(daemon, server, resolved, mode, name, ttl_secs))
+            Ok(grant(
+                daemon,
+                server,
+                Target::File(path),
+                mode,
+                name,
+                ttl_secs,
+            ))
         }
 
         NodeOp::BackupTicket {
@@ -561,7 +571,7 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             Ok(grant(
                 daemon,
                 server,
-                archive,
+                Target::Backup(backup),
                 TicketMode::Download,
                 format!("{backup}.tar.gz"),
                 ttl_secs,
@@ -579,14 +589,14 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
 fn grant(
     daemon: &Daemon,
     server: Uuid,
-    path: std::path::PathBuf,
+    target: Target,
     mode: TicketMode,
     filename: String,
     ttl_secs: u64,
 ) -> Value {
     let token = daemon
         .http_tickets
-        .issue(server, path, mode, filename, ttl_secs);
+        .issue(server, target, mode, filename, ttl_secs);
 
     let url = daemon
         .cfg

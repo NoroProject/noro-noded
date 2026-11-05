@@ -1,13 +1,12 @@
 //! Проверки тикетов: главное здесь — что второй раз по ссылке не пройти.
 
-use super::tickets::Tickets;
+use super::tickets::{Target, Tickets};
 use schema::noded::TicketMode;
-use std::path::PathBuf;
 
 fn issue(t: &Tickets, mode: TicketMode, ttl: u64) -> String {
     t.issue(
         uuid::Uuid::new_v4(),
-        PathBuf::from("/tmp/whatever"),
+        Target::File("mods/whatever.jar".into()),
         mode,
         "file.jar".into(),
         ttl,
@@ -66,4 +65,34 @@ fn the_mode_travels_with_the_ticket() {
 fn a_quote_cannot_break_out_of_the_header() {
     assert_eq!(super::safe_name("evil\";drop.jar"), "evil;drop.jar");
     assert_eq!(super::safe_name("line\nbreak.jar"), "linebreak.jar");
+}
+
+/// Путь разрешается в момент передачи: ссылка, подложенная после выдачи
+/// тикета, наружу не выводит.
+#[test]
+#[cfg(unix)]
+fn the_path_is_resolved_again_at_transfer_time() {
+    let base = std::env::temp_dir().join(format!("noded-ticket-{}", uuid::Uuid::new_v4()));
+    let root = base.join("server");
+    let outside = base.join("host");
+    std::fs::create_dir_all(root.join("logs")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("logs/latest.log"), "log").unwrap();
+    std::fs::write(outside.join("latest.log"), "host secret").unwrap();
+
+    let tickets = Tickets::default();
+    let token = tickets.issue(
+        uuid::Uuid::nil(),
+        Target::File("logs/latest.log".into()),
+        TicketMode::Download,
+        "latest.log".into(),
+        60,
+    );
+    // Выдача прошла по настоящему каталогу; теперь его подменяют ссылкой.
+    std::fs::remove_dir_all(root.join("logs")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("logs")).unwrap();
+
+    let ticket = tickets.take(&token).unwrap();
+    assert!(ticket.path(&root).is_err(), "наружу тикет не ведёт");
+    std::fs::remove_dir_all(base).unwrap();
 }

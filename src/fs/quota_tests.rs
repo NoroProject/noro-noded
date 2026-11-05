@@ -24,6 +24,7 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_file(limits_path(&self.root));
     }
 }
 
@@ -103,4 +104,42 @@ async fn the_service_directory_counts_too() {
             .used_mb()
             >= 1
     );
+}
+
+#[test]
+fn a_huge_request_does_not_wrap_around() {
+    let usage = Usage {
+        used_bytes: 1024,
+        limit_bytes: 10 * 1024 * 1024,
+    };
+    assert!(usage.fits(u64::MAX).is_err());
+    assert!(usage.fits(u64::MAX - 512).is_err());
+}
+
+/// Лимит живёт вне каталога, который видит контейнер: переписать его оттуда
+/// нечем.
+#[tokio::test]
+async fn the_limit_is_kept_outside_the_server_directory() {
+    let s = Sandbox::new(4);
+    assert!(!limits_path(&s.root).starts_with(&s.root));
+    std::fs::create_dir_all(s.root.join(".noro")).unwrap();
+    std::fs::write(s.root.join(".noro/limits.json"), r#"{"disk_mb":0}"#).unwrap();
+
+    let usage = Quota::default().usage(Uuid::new_v4(), &s.root).await;
+    assert_eq!(
+        usage.limit_bytes,
+        4 * 1024 * 1024,
+        "подделка внутри не действует"
+    );
+}
+
+#[tokio::test]
+async fn an_old_limit_is_carried_over_once() {
+    let s = Sandbox::new(0);
+    std::fs::create_dir_all(s.root.join(".noro")).unwrap();
+    std::fs::write(s.root.join(".noro/limits.json"), r#"{"disk_mb":7}"#).unwrap();
+
+    assert_eq!(read_limits(&s.root).disk_mb, 7);
+    assert!(limits_path(&s.root).exists(), "перенесён");
+    assert!(!s.root.join(".noro/limits.json").exists());
 }

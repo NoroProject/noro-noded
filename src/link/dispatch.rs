@@ -138,6 +138,7 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
             daemon.quota.forget(server);
             if !keep_files {
                 let dir = daemon.cfg.server_dir(server);
+                let _ = std::fs::remove_file(fs::quota::limits_path(&dir));
                 if dir.exists() {
                     std::fs::remove_dir_all(&dir)
                         .map_err(|e| OpError::new("docker_failed", e.to_string()))?;

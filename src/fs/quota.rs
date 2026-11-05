@@ -26,11 +26,10 @@ use uuid::Uuid;
 /// Через сколько замер считается несвежим.
 const TTL: Duration = Duration::from_secs(60);
 
-/// Имя файла с лимитами внутри служебного каталога сервера.
-///
-/// На диске, а не в памяти: лимит нужен и после перезапуска демона, а реестр
-/// переживать его не должен — правда о контейнерах живёт в докере.
-const LIMITS_FILE: &str = "limits.json";
+/// Прежнее место лимитов — внутри служебного каталога сервера. Оттуда они
+/// только переносятся: каталог примонтирован в контейнер, и процесс сервера
+/// переписывал `{"disk_mb": 0}` — то есть снимал с себя квоту.
+const LEGACY_LIMITS_FILE: &str = "limits.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct Limits {
@@ -38,21 +37,45 @@ pub struct Limits {
     pub disk_mb: i64,
 }
 
+/// Где лежат лимиты: рядом с каталогом сервера, а не в нём.
+///
+/// На диске, а не в памяти: лимит нужен и после перезапуска демона, а реестр
+/// переживать его не должен — правда о контейнерах живёт в докере. Рядом, а не
+/// внутри: в контейнер монтируется только сам каталог сервера.
+pub fn limits_path(root: &Path) -> std::path::PathBuf {
+    let mut name = root.file_name().unwrap_or_default().to_os_string();
+    name.push(".limits.json");
+    root.with_file_name(name)
+}
+
 pub fn write_limits(root: &Path, limits: &Limits) -> Result<()> {
-    let dir = root.join(crate::server::layout::SERVICE_DIR);
-    std::fs::create_dir_all(&dir)?;
-    crate::fs::nofollow::write(&dir.join(LIMITS_FILE), &serde_json::to_vec_pretty(limits)?)?;
+    crate::fs::nofollow::write(&limits_path(root), &serde_json::to_vec_pretty(limits)?)?;
+    let legacy = root
+        .join(crate::server::layout::SERVICE_DIR)
+        .join(LEGACY_LIMITS_FILE);
+    let _ = crate::fs::nofollow::remove(&legacy);
     Ok(())
 }
 
 pub fn read_limits(root: &Path) -> Limits {
-    let path = root
+    if let Ok(bytes) = std::fs::read(limits_path(root)) {
+        return serde_json::from_slice(&bytes).unwrap_or_default();
+    }
+    // Сервер ставили до переноса: берём старый файл один раз и переносим.
+    // Подделать его владелец мог и раньше; после переноса — уже нет.
+    let legacy = root
         .join(crate::server::layout::SERVICE_DIR)
-        .join(LIMITS_FILE);
-    std::fs::read(path)
+        .join(LEGACY_LIMITS_FILE);
+    let Some(limits) = crate::fs::nofollow::read(&legacy)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .and_then(|bytes| serde_json::from_slice::<Limits>(&bytes).ok())
+    else {
+        return Limits::default();
+    };
+    if let Err(e) = write_limits(root, &limits) {
+        tracing::warn!(error = %e, "лимит диска не перенесён");
+    }
+    limits
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,7 +105,10 @@ impl Usage {
         if self.limit_bytes == 0 {
             return Ok(());
         }
-        if self.used_bytes + extra > self.limit_bytes {
+        // Насыщение, а не сложение: `extra` бывает и из заголовка запроса, и
+        // `Content-Length: 18446744073709551615` переполнял сумму в малое число —
+        // заливка без предела проходила проверку.
+        if self.used_bytes.saturating_add(extra) > self.limit_bytes {
             bail!(
                 "не хватает места: занято {} МБ из {} МБ, требуется ещё {} МБ",
                 self.used_bytes / 1024 / 1024,
@@ -143,7 +169,7 @@ impl Quota {
             });
         };
 
-        let limit_bytes = limit_mb * 1024 * 1024;
+        let limit_bytes = limit_mb.saturating_mul(1024 * 1024);
         self.inner.insert(
             server,
             Entry {

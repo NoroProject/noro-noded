@@ -137,8 +137,11 @@ jobs:
     if: github.repository == 'NoroProject/noro-noded'
     runs-on: [self-hosted, noded]
     steps:
+      # Only the daemon binaries: the image job runs alongside and uploads its
+      # own build record mid-way, and fetching "everything" then fails on it.
       - uses: actions/download-artifact@v4
         with:
+          pattern: noded-*
           path: artifacts
           merge-multiple: true
 

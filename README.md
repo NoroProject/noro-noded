@@ -69,8 +69,11 @@ is only valid inside this container produces a silently empty mount.
   server is doing. Only loopback clients get an answer; the master gets the
   same report through `NodeInfo`.
 - `disk_reserve_mb` in the config (2048 by default, `0` to turn it off) is the
-  space on the data disk that uploads, unpacking and downloads never take, so
-  running servers always have room to save their worlds.
+  space on the data disk that uploads, unpacking, downloads and backups never
+  take, so running servers always have room to save their worlds.
+- The daemon warns the master once when a server reaches 90% of its disk quota
+  or the data disk reaches 90% of what the reserve leaves, and once more when it
+  drops back under 85%.
 
 ## Security
 

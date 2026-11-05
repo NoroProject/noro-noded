@@ -1,4 +1,4 @@
-// Файл превышает 150 строк: сборка демона и его фоновые задачи (замеры, уборка, переподключение) — одна точка старта.
+// Файл превышает 150 строк: сборка демона и его фоновые задачи (уборка, переподключение, SFTP) — одна точка старта.
 //! `noro-noded` — демон ноды.
 //!
 //! Держит игровые серверы в контейнерах и ходит к мастеру исходящим
@@ -14,6 +14,7 @@ mod fs;
 mod http;
 mod link;
 mod metrics;
+mod sampling;
 mod server;
 mod sftp;
 
@@ -135,74 +136,12 @@ async fn main() -> Result<()> {
     // Прямая передача — отдельной задачей: её слушатель живёт весь срок работы
     // демона, а канал с мастером ниже занимает основной поток.
     tokio::spawn(http::serve(daemon.clone()));
-    spawn_node_stats(daemon.clone(), events_tx.clone());
+    sampling::spawn_node_stats(daemon.clone(), events_tx.clone());
     spawn_sweep(&daemon);
-    spawn_server_stats(daemon.clone(), events_tx);
+    sampling::spawn_server_stats(daemon.clone(), events_tx);
 
     link::session::run(daemon, events_rx).await
 }
-
-/// Замеры по каждому работающему серверу.
-///
-/// Без этой задачи `NodeEvent::Stats` не отправлялся вовсе: мастер его ждал, а
-/// графики в панели рисовали пустоту. Раз в двадцать секунд — чаще незачем,
-/// докер отдаёт счётчики с секундным шагом, а обход каталога под диск не
-/// бесплатен.
-fn spawn_server_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
-    use futures_util::StreamExt;
-
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
-        // Докер отвечает на замер не сразу, а через секунду-две: ему нужна
-        // разница счётчиков. По одному серверу за раз двадцать серверов не
-        // укладывались в интервал, а пропущенные тики `interval` по умолчанию
-        // догоняет залпом — и опрос докера шёл без передышки. Теперь замеры
-        // идут по нескольку разом, а опоздавший тик просто сдвигается.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let up: Vec<_> = daemon
-                .registry
-                .ids()
-                .into_iter()
-                .filter(|server| {
-                    daemon
-                        .registry
-                        .get(*server)
-                        .is_some_and(|h| h.state().power.is_up())
-                })
-                .collect();
-            let samples = futures_util::stream::iter(up)
-                .map(|server| {
-                    let daemon = &daemon;
-                    async move {
-                        let root = daemon.cfg.server_dir(server);
-                        let stats = daemon
-                            .engine
-                            .stats_with_disk(server, &daemon.quota, &root)
-                            .await;
-                        (server, stats)
-                    }
-                })
-                .buffer_unordered(STATS_PARALLEL)
-                .collect::<Vec<_>>()
-                .await;
-            for (server, stats) in samples {
-                match stats {
-                    Ok(stats) => {
-                        let _ = events.try_send(NodeEvent::Stats { server, stats });
-                    }
-                    // Контейнер могли снять между перечислением и замером —
-                    // это не повод шуметь в лог на каждом тике.
-                    Err(e) => tracing::debug!(%server, error = %e, "замер не удался"),
-                }
-            }
-        }
-    });
-}
-
-/// Сколько серверов меряется одновременно.
-const STATS_PARALLEL: usize = 8;
 
 /// Убрать временные файлы оборванных до рестарта операций — в фоне, по
 /// одному серверу: это обход каталогов, и старт демона он ждать не должен.
@@ -297,33 +236,4 @@ async fn start_sftp(daemon: &Daemon) {
         }
         Err(e) => tracing::error!(error = %format!("{e:#}"), "sftp не поднялся"),
     }
-}
-
-/// Метрики машины раз в полминуты: чаще панели не нужно, а sysinfo не бесплатен.
-fn spawn_node_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sampler = metrics::Sampler::new();
-        loop {
-            ticker.tick().await;
-            let running = daemon
-                .registry
-                .ids()
-                .iter()
-                .filter(|id| {
-                    daemon
-                        .registry
-                        .get(**id)
-                        .map(|h| h.state().power.is_up())
-                        .unwrap_or(false)
-                })
-                .count() as u32;
-            let _ = events
-                .send(NodeEvent::NodeStats {
-                    stats: sampler.sample(running, &daemon.cfg.data_dir),
-                })
-                .await;
-        }
-    });
 }

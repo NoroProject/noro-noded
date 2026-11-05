@@ -69,13 +69,10 @@ pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<()> {
         super::resolve_existing(root, rel)?;
     }
 
-    let tmp = path.with_extension(format!(
-        "{}.noro-tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    // Временный файл — со случайным именем и эксклюзивно: предсказуемое имя
+    // рядом с целью процесс сервера занимал ссылкой на файл хоста, и правка из
+    // панели записывала туда.
+    super::nofollow::write(&path, content.as_bytes())
 }
 
 pub fn mkdir(root: &Path, rel: &str) -> Result<()> {
@@ -135,7 +132,7 @@ pub fn copy(root: &Path, from: &str, to: &str) -> Result<u64> {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&src, &dst)?;
+        super::nofollow::copy_file(&src, &dst)?;
         return Ok(1);
     }
 
@@ -147,7 +144,7 @@ pub fn copy(root: &Path, from: &str, to: &str) -> Result<u64> {
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&target)?;
         } else if entry.file_type().is_file() {
-            std::fs::copy(entry.path(), &target)?;
+            super::nofollow::copy_file(entry.path(), &target)?;
             count += 1;
         }
     }

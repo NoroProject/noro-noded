@@ -68,7 +68,7 @@ fn unpack_zip(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = BufWriter::new(File::create(&target)?);
+        let mut out = BufWriter::new(super::nofollow::create_replacing(&target)?);
         std::io::copy(&mut entry, &mut out)?;
         written += 1;
     }
@@ -103,7 +103,7 @@ fn unpack_tar(root: &Path, archive: &Path, dest_dir: &str) -> Result<u64> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = BufWriter::new(File::create(&target)?);
+        let mut out = BufWriter::new(super::nofollow::create_replacing(&target)?);
         std::io::copy(&mut entry, &mut out)?;
         written += 1;
     }
@@ -145,13 +145,13 @@ pub fn pack(root: &Path, paths: &[String], dest: &str) -> Result<u64> {
                     .to_string_lossy()
                     .replace('\\', "/");
                 zip.start_file(inner, options)?;
-                let mut file = File::open(entry.path())?;
+                let mut file = super::nofollow::open_existing(entry.path(), false)?;
                 std::io::copy(&mut file, &mut zip)?;
                 count += 1;
             }
         } else {
             zip.start_file(rel.replace('\\', "/"), options)?;
-            let mut file = File::open(&source)?;
+            let mut file = super::nofollow::open_existing(&source, false)?;
             std::io::copy(&mut file, &mut zip)?;
             count += 1;
         }

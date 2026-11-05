@@ -79,6 +79,37 @@ pub fn open_existing(path: &Path, write: bool) -> std::io::Result<std::fs::File>
     Ok(file)
 }
 
+/// Создать файл заново, убрав то, что лежало на его месте, — файл или ссылку.
+///
+/// Эксклюзивное создание после удаления: подложи процесс сервера ссылку в
+/// промежутке, создание откажет, а не пойдёт по ней.
+pub fn create_replacing(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a directory is in the way",
+            ))
+        }
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(_) => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Скопировать обычный файл в новый, не идя по ссылкам ни с одной стороны.
+pub fn copy_file(from: &Path, to: &Path) -> std::io::Result<u64> {
+    let mut src = open_existing(from, false)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut src, &mut dst)
+}
+
 /// Прочитать файл целиком, если это обычный файл, а не ссылка.
 pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;

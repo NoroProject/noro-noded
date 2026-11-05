@@ -175,6 +175,19 @@ fn memory_swap(spec: &ServerSpec) -> i64 {
     }
 }
 
+/// Запреты, общие для сервера и его установщика.
+///
+/// Процесс и так не root, но в образе бывают setuid-программы (`su`, `sudo`,
+/// `passwd`): плагин, запустивший такую, становился root внутри контейнера, а
+/// оттуда до побега остаётся одна уязвимость ядра. `no-new-privileges` не даёт
+/// поднять права через exec, а без единой capability нечем и пользоваться.
+/// Java-серверу ни то ни другое не нужно.
+pub(crate) fn locked_down(mut hc: HostConfig) -> HostConfig {
+    hc.security_opt = Some(vec!["no-new-privileges:true".into()]);
+    hc.cap_drop = Some(vec!["ALL".into()]);
+    hc
+}
+
 fn host_config(args: CreateArgs<'_>) -> HostConfig {
     let spec = args.spec;
 
@@ -191,7 +204,7 @@ fn host_config(args: CreateArgs<'_>) -> HostConfig {
         }
     }
 
-    HostConfig {
+    locked_down(HostConfig {
         // Ровно один маунт. Больше контейнеру знать о машине не положено.
         binds: Some(vec![format!(
             "{}:{CONTAINER_ROOT}",
@@ -212,7 +225,7 @@ fn host_config(args: CreateArgs<'_>) -> HostConfig {
             maximum_retry_count: None,
         }),
         ..Default::default()
-    }
+    })
 }
 
 #[cfg(test)]

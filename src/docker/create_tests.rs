@@ -169,7 +169,12 @@ fn exactly_one_bind_and_nothing_dangerous() {
     assert!(hc.cap_add.is_none(), "лишние capability не выдаются");
     assert!(hc.network_mode.is_none(), "сеть хоста не отдаётся");
     assert!(hc.devices.is_none());
-    assert!(hc.security_opt.is_none());
+    // Ни `seccomp=unconfined`, ни `apparmor=unconfined`: только запрет
+    // поднимать права.
+    assert_eq!(
+        hc.security_opt.as_deref(),
+        Some(&["no-new-privileges:true".to_string()][..])
+    );
 }
 
 /// Докер перезапускал бы сервер вечно и молча, не зная ни про crash loop, ни
@@ -227,4 +232,18 @@ fn swap_is_added_to_memory() {
 
     spec.swap_mb = Some(-1);
     assert_eq!(super::memory_swap(&spec), -1);
+}
+
+/// Плагин не должен подниматься до root через setuid-программы образа.
+#[test]
+fn the_container_cannot_gain_privileges() {
+    let s = spec();
+    let hc = host_config(args_for(&s));
+    assert_eq!(
+        hc.security_opt.as_deref(),
+        Some(&["no-new-privileges:true".to_string()][..])
+    );
+    assert_eq!(hc.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert!(hc.cap_add.is_none());
+    assert!(hc.privileged.is_none());
 }

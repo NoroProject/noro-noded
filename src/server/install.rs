@@ -270,13 +270,13 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
         user: Some(format!("{CONTAINER_UID}:{CONTAINER_GID}")),
         working_dir: Some(CONTAINER_ROOT.to_string()),
         cmd: Some(cmd),
-        host_config: Some(HostConfig {
+        host_config: Some(crate::docker::create::locked_down(HostConfig {
             binds: Some(vec![format!("{}:{CONTAINER_ROOT}", ctx.host_dir.display())]),
             // Установщику нужна сеть — он тянет библиотеки, — но не нужно
             // ничего сверх неё.
             memory: Some(2048 * 1024 * 1024),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
 

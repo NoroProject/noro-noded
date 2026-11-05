@@ -10,6 +10,7 @@
 //! сессий, ни токенов ноды у браузера нет. Поэтому тикет одноразовый, живёт
 //! минуты и указывает на один конкретный путь, разрешённый заранее.
 
+mod listen;
 pub mod tickets;
 
 use axum::body::Body;
@@ -83,10 +84,7 @@ pub async fn serve(daemon: Daemon) {
     };
     tracing::info!(%bind, "прямая передача слушает");
 
-    let app = router(daemon).into_make_service_with_connect_info::<std::net::SocketAddr>();
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!(error = %e, "слушатель прямой передачи остановился");
-    }
+    listen::run(listener, router(daemon), listen::HEADER_READ_TIMEOUT).await;
 }
 
 async fn healthz() -> &'static str {

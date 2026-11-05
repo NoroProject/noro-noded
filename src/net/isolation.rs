@@ -30,6 +30,8 @@ const RESOLV_CONFS: &[&str] = &["/run/systemd/resolve/resolv.conf", "/etc/resolv
 
 pub struct Isolation {
     enabled: bool,
+    /// Адрес мастера: до него серверу нужно всегда — агент, Yggdrasil.
+    master_url: String,
     pool: Cidr,
     allow: Vec<Allow>,
     groups_file: PathBuf,
@@ -62,6 +64,7 @@ impl Isolation {
             .unwrap_or_default();
         Ok(Self {
             enabled: cfg.network.isolation,
+            master_url: cfg.master_url.clone(),
             pool,
             allow,
             groups_file,
@@ -102,8 +105,10 @@ impl Isolation {
             Some(problem) => Err(anyhow::anyhow!(problem)),
             None => {
                 let groups = self.members(engine).await;
+                let mut allow = self.allow.clone();
+                allow.extend(master_allow(&self.master_url).await);
                 let script = rules::restore_script(&Plan {
-                    allow: &self.allow,
+                    allow: &allow,
                     resolvers: &read_resolvers(),
                     groups: &groups,
                 });
@@ -180,6 +185,36 @@ impl Isolation {
         }
         out
     }
+}
+
+/// Мастер — всегда разрешён, на его порт.
+///
+/// Агент сервера и authlib-injector ходят к нему по публичному адресу. Где
+/// этот адрес принадлежит самой машине, а мастер слушает прямо на ней (traefik
+/// в сети хоста), запрет служб хоста отрезал бы сервер от входа игроков.
+/// Имя разрешается заново при каждой установке правил: адрес мастера может
+/// смениться, а держать старый незачем.
+async fn master_allow(master_url: &str) -> Vec<Allow> {
+    let Some((host, port)) = rules::endpoint(master_url) else {
+        return Vec::new();
+    };
+    let resolved = tokio::net::lookup_host((host.as_str(), port)).await;
+    let mut out: Vec<Allow> = Vec::new();
+    for addr in resolved.into_iter().flatten() {
+        if let std::net::IpAddr::V4(ip) = addr.ip() {
+            let allow = Allow {
+                net: Cidr {
+                    addr: ip,
+                    prefix: 32,
+                },
+                port: Some(port),
+            };
+            if !out.contains(&allow) {
+                out.push(allow);
+            }
+        }
+    }
+    out
 }
 
 /// Группы без удалённого сервера; группа из одного больше не группа.

@@ -53,6 +53,19 @@ fn allow_entries_parse_with_and_without_a_port() {
     assert!(parse_allow("db.local").is_err());
 }
 
+#[test]
+fn the_master_endpoint_takes_the_scheme_port_unless_given() {
+    assert_eq!(
+        endpoint("https://api.noro.rest"),
+        Some(("api.noro.rest".into(), 443))
+    );
+    assert_eq!(
+        endpoint("http://10.0.0.5:8080"),
+        Some(("10.0.0.5".into(), 8080))
+    );
+    assert_eq!(endpoint("not a url"), None);
+}
+
 /// OCI кладёт свой резолвер на адрес метаданных; systemd-resolved — на петлю,
 /// и та докеру не нужна: к ней он ходит сам, с хоста.
 #[test]

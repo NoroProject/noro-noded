@@ -89,6 +89,12 @@ pub fn parse_allow(s: &str) -> Result<Allow, String> {
     })
 }
 
+/// Хост и порт из адреса мастера: `https://api.example.com` → 443.
+pub fn endpoint(url: &str) -> Option<(String, u16)> {
+    let url = reqwest::Url::parse(url).ok()?;
+    Some((url.host_str()?.to_string(), url.port_or_known_default()?))
+}
+
 /// DNS-серверы из `resolv.conf`, кроме петли.
 ///
 /// Встроенный DNS докера ходит к ним изнутри сети контейнера, так что запреты

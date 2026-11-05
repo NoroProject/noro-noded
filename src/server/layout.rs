@@ -56,29 +56,35 @@ impl Layout {
     }
 
     pub fn read_primary_port(&self) -> Option<u16> {
-        std::fs::read_to_string(self.primary_port_file())
+        crate::fs::nofollow::read_to_string(&self.primary_port_file())
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())
     }
 
     pub fn write_primary_port(&self, port: u16) -> Result<()> {
         std::fs::create_dir_all(self.service_dir())?;
-        std::fs::write(self.primary_port_file(), port.to_string())?;
+        crate::fs::nofollow::write(&self.primary_port_file(), port.to_string().as_bytes())?;
         Ok(())
     }
 }
 
+/// Отдать каталог сервера uid контейнера.
+///
+/// Только `lchown`: каталог сервера меняет процесс в контейнере, и ссылка
+/// `x -> /var/run/docker.sock` в нём — обычное дело для злоумышленника. `chown`
+/// пошёл бы по ней и отдал файл хоста uid контейнера, а на многих машинах этот
+/// uid — первый пользователь хоста, то есть сокет докера и с ним root.
 #[cfg(unix)]
 pub fn chown_recursive(path: &Path) -> Result<()> {
     use crate::docker::engine::{CONTAINER_GID, CONTAINER_UID};
-    use std::os::unix::fs::chown;
+    use std::os::unix::fs::lchown;
 
-    chown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
+    lchown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
     for entry in walkdir::WalkDir::new(path).follow_links(false) {
         let entry = entry?;
         // Ошибку на одном файле не превращаем в отказ целиком: каталог мог
         // измениться прямо во время обхода, и это нормально.
-        let _ = chown(entry.path(), Some(CONTAINER_UID), Some(CONTAINER_GID));
+        let _ = lchown(entry.path(), Some(CONTAINER_UID), Some(CONTAINER_GID));
     }
     Ok(())
 }
@@ -93,9 +99,11 @@ pub fn chown_recursive(_path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn chown_path(path: &Path) -> Result<()> {
     use crate::docker::engine::{CONTAINER_GID, CONTAINER_UID};
-    use std::os::unix::fs::chown;
+    use std::os::unix::fs::lchown;
 
-    chown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
+    // `lchown` по той же причине, что и в `chown_recursive`: между записью
+    // файла и сменой владельца на его место могли подложить ссылку.
+    lchown(path, Some(CONTAINER_UID), Some(CONTAINER_GID))?;
     Ok(())
 }
 

@@ -99,8 +99,10 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
         return (StatusCode::METHOD_NOT_ALLOWED, "ticket is for upload").into_response();
     }
 
-    let file = match tokio::fs::File::open(&ticket.path).await {
-        Ok(f) => f,
+    // Путь разрешён при выдаче тикета, а за минуты до скачивания процесс
+    // сервера мог положить на его место ссылку на файл хоста.
+    let file = match crate::fs::nofollow::open_existing(&ticket.path, false) {
+        Ok(f) => tokio::fs::File::from_std(f),
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -160,7 +162,16 @@ async fn upload(
     // Пишем во временный файл рядом и переименовываем: оборванная заливка
     // иначе оставляет обрезанный jar, который сервер пытается загрузить.
     let tmp = ticket.path.with_extension("noro-upload");
-    let mut file = match tokio::fs::File::create(&tmp).await {
+    // Эксклюзивно: на месте временного файла процесс сервера мог заранее
+    // положить ссылку на файл хоста, и `create` записал бы заливку туда от
+    // имени демона. Свой же старый недописанный файл убирается перед этим.
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await
+    {
         Ok(f) => f,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };

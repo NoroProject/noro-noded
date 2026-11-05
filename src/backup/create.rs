@@ -114,6 +114,10 @@ fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
     let file = std::fs::File::create(dest).context("не создать файл архива")?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = tar::Builder::new(encoder);
+    // По умолчанию tar идёт по ссылкам и кладёт в архив то, на что они ведут.
+    // Ссылку на файл хоста в каталог сервера кладёт его же владелец, а бэкап
+    // потом скачивает — так он унёс бы конфиг ноды с её токеном.
+    tar.follow_symlinks(false);
 
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)

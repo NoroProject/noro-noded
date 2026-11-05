@@ -211,13 +211,27 @@ impl russh_sftp::server::Handler for SftpSession {
         self.room_for_handle(&filename)?;
 
         let path = self.resolve(&filename)?;
-        let file = std::fs::OpenOptions::new()
-            .read(pflags.contains(russh_sftp::protocol::OpenFlags::READ))
-            .write(writing)
-            .create(pflags.contains(russh_sftp::protocol::OpenFlags::CREATE))
-            .truncate(pflags.contains(russh_sftp::protocol::OpenFlags::TRUNCATE))
-            .open(&path)
-            .map_err(|_| StatusCode::NoSuchFile)?;
+        // Между разрешением пути и открытием процесс сервера может положить на
+        // его место ссылку на файл хоста. Существующий файл открывается со
+        // сверкой, что это тот же обычный файл, и обрезается только после неё;
+        // новый создаётся эксклюзивно — по подложенной ссылке он не пойдёт.
+        let file = if std::fs::symlink_metadata(&path).is_ok() {
+            let file = crate::fs::nofollow::open_existing(&path, writing)
+                .map_err(|_| StatusCode::PermissionDenied)?;
+            if pflags.contains(russh_sftp::protocol::OpenFlags::TRUNCATE) {
+                file.set_len(0).map_err(|_| StatusCode::Failure)?;
+            }
+            file
+        } else if pflags.contains(russh_sftp::protocol::OpenFlags::CREATE) {
+            std::fs::OpenOptions::new()
+                .read(pflags.contains(russh_sftp::protocol::OpenFlags::READ))
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| StatusCode::Failure)?
+        } else {
+            return Err(StatusCode::NoSuchFile);
+        };
 
         if writing {
             self.report(SftpActionKind::Write, &filename);

@@ -130,7 +130,7 @@ pub fn apply(root: &Path, staging: &Path) -> Result<bool> {
     for stale in previous.unwrap_or_default().difference(&owned) {
         remove_stale(root, stale);
     }
-    std::fs::write(root.join(RECORD), serde_json::to_vec(&owned)?)?;
+    crate::fs::nofollow::write(&root.join(RECORD), &serde_json::to_vec(&owned)?)?;
     Ok(untracked)
 }
 
@@ -178,7 +178,7 @@ fn single_top_dir(staging: &Path) -> Option<PathBuf> {
 
 /// Папка мира берётся из `server.properties`: её можно переименовать.
 fn level_name(root: &Path) -> String {
-    std::fs::read_to_string(root.join("server.properties"))
+    crate::fs::nofollow::read_to_string(&root.join("server.properties"))
         .ok()
         .and_then(|text| {
             text.lines()
@@ -211,7 +211,7 @@ fn merge_missing(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn previous_files(root: &Path) -> Option<BTreeSet<String>> {
-    std::fs::read(root.join(RECORD))
+    crate::fs::nofollow::read(&root.join(RECORD))
         .ok()
         .and_then(|raw| serde_json::from_slice(&raw).ok())
 }

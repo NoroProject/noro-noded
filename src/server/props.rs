@@ -13,7 +13,9 @@ pub fn apply(path: &Path, changes: &BTreeMap<String, String>) -> Result<()> {
         return Ok(());
     }
 
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Без перехода по ссылке: иначе файл хоста, на который она ведёт, слился бы
+    // с настройками и лёг в каталог сервера, на виду у его владельца.
+    let existing = crate::fs::nofollow::read_to_string(path).unwrap_or_default();
     let mut remaining = changes.clone();
     let mut out = String::with_capacity(existing.len() + 128);
 
@@ -40,14 +42,14 @@ pub fn apply(path: &Path, changes: &BTreeMap<String, String>) -> Result<()> {
         out.push_str(&format!("{key}={value}\n"));
     }
 
-    std::fs::write(path, out)?;
+    crate::fs::nofollow::write(path, out.as_bytes())?;
     Ok(())
 }
 
 /// Согласиться с EULA. Сервер без этого файла пишет строку в лог и выходит, а
 /// выглядит это как «не запускается».
 pub fn accept_eula(path: &Path) -> Result<()> {
-    std::fs::write(path, "# accepted by the Noro panel\neula=true\n")?;
+    crate::fs::nofollow::write(path, b"# accepted by the Noro panel\neula=true\n")?;
     Ok(())
 }
 

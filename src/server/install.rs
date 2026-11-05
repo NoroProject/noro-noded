@@ -67,7 +67,7 @@ pub fn sync_user_jvm_args(root: &Path, authlib_url: Option<&str>) -> Result<()> 
     if !path.is_file() {
         return Ok(());
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = crate::fs::nofollow::read_to_string(&path)?;
     let mut lines: Vec<String> = content
         .lines()
         .filter(|line| !line.trim().contains("authlib-injector.jar"))
@@ -83,7 +83,7 @@ pub fn sync_user_jvm_args(root: &Path, authlib_url: Option<&str>) -> Result<()> 
 
     let mut result = lines.join("\n");
     result.push('\n');
-    std::fs::write(&path, result)?;
+    crate::fs::nofollow::write(&path, result.as_bytes())?;
     Ok(())
 }
 

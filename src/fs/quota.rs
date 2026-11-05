@@ -41,7 +41,7 @@ pub struct Limits {
 pub fn write_limits(root: &Path, limits: &Limits) -> Result<()> {
     let dir = root.join(crate::server::layout::SERVICE_DIR);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(LIMITS_FILE), serde_json::to_vec_pretty(limits)?)?;
+    crate::fs::nofollow::write(&dir.join(LIMITS_FILE), &serde_json::to_vec_pretty(limits)?)?;
     Ok(())
 }
 

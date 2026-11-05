@@ -124,7 +124,7 @@ pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
         bail!("у пути архива нет имени");
     };
     tokio::fs::create_dir_all(parent).await?;
-    // Мимо ссылок: каталог бэкапов внутри папки сервера.
+    // Мимо ссылок, как всякая запись демона в каталог данных.
     let dir = crate::fs::nofollow::Dir::open(parent)?;
     let tmp = {
         let mut tmp = std::ffi::OsString::from(".");

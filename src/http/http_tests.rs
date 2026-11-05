@@ -93,6 +93,6 @@ fn the_path_is_resolved_again_at_transfer_time() {
     std::os::unix::fs::symlink(&outside, root.join("logs")).unwrap();
 
     let ticket = tickets.take(&token).unwrap();
-    assert!(ticket.path(&root).is_err(), "наружу тикет не ведёт");
+    assert!(ticket.path(&root, &root).is_err(), "наружу тикет не ведёт");
     std::fs::remove_dir_all(base).unwrap();
 }

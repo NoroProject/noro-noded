@@ -155,6 +155,14 @@ impl Quota {
         }
     }
 
+    /// Учесть запись, которая квоте сервера не принадлежит (архив бэкапа), —
+    /// в запасе ноды она всё равно заняла место.
+    pub fn node_consume(&self, bytes: u64) {
+        if let Some(reserve) = &self.reserve {
+            reserve.consume(bytes);
+        }
+    }
+
     /// Текущее занятое место. Меряет заново, если последний замер протух.
     pub async fn usage(&self, server: Uuid, root: &Path) -> Usage {
         if let Some(entry) = self.cached(server) {

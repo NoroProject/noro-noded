@@ -48,7 +48,9 @@ impl Layout {
         Ok(())
     }
 
-    pub fn backups_dir(&self) -> PathBuf {
+    /// Где архивы лежали прежде — внутри каталога сервера. Отсюда они только
+    /// переносятся, см. `backup::store`.
+    pub fn legacy_backups_dir(&self) -> PathBuf {
         self.root.join(SERVICE_DIR).join("backups")
     }
 

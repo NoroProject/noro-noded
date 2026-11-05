@@ -12,6 +12,8 @@ use flate2::Compression;
 use sha2::Digest;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::server::registry::Registry;
@@ -29,23 +31,48 @@ const FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// хранилище вместе с миром.
 const NEVER: &[&str] = &["logs", "crash-reports", ".noro", "backups"];
 
+#[derive(Debug)]
 pub struct BackupResult {
     pub bytes: u64,
     pub sha256: String,
 }
 
+/// Архив перерос отведённое ему место — лимит бэкапов сервера или запас диска
+/// ноды. Отдельным типом, чтобы отказ дошёл до мастера своим кодом, а не
+/// «докер не смог».
+#[derive(Debug)]
+pub struct OverBudget {
+    pub limit: u64,
+}
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "архив не помещается в отведённые ему {} МБ",
+            self.limit / 1024 / 1024
+        )
+    }
+}
+
+impl std::error::Error for OverBudget {}
+
+/// Снять бэкап. `limit` — сколько байт архиву можно занять; упаковка
+/// обрывается, как только он вырастает больше, а не после того, как съела
+/// весь диск.
 pub async fn create(
     registry: &Registry,
     root: &Path,
     dest: &Path,
     ignore: &[String],
+    limit: Option<u64>,
 ) -> Result<BackupResult> {
     let quiesced = quiesce(registry, root).await;
 
     // Упаковка мира — это gzip поверх гигабайтов: на рабочем потоке рантайма
     // она останавливает консоли всех серверов ноды на всё время бэкапа.
     let (src, dst, ignore) = (root.to_path_buf(), dest.to_path_buf(), ignore.to_vec());
-    let result = tokio::task::spawn_blocking(move || pack(&src, &dst, &ignore))
+    let result = tokio::task::spawn_blocking(move || pack(&src, &dst, &ignore, limit))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("упаковка не выполнена: {e}")));
 
@@ -108,15 +135,15 @@ fn server_id_of(root: &Path) -> Option<uuid::Uuid> {
         .and_then(|n| uuid::Uuid::parse_str(n).ok())
 }
 
-fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Каталог бэкапов лежит внутри папки сервера, а её меняет процесс сервера:
-    // на месте архива могла оказаться ссылка на файл хоста.
+fn pack(root: &Path, dest: &Path, ignore: &[String], limit: Option<u64>) -> Result<BackupResult> {
+    // Каталог бэкапов вне папки сервера, но создаётся архив всё равно мимо
+    // ссылок: так он не зависит от того, кто и что положил на его место.
     let file = crate::fs::nofollow::create_replacing(dest).context("не создать файл архива")?;
-    let result = write_archive(root, file, ignore);
+    let over = Arc::new(AtomicBool::new(false));
+    let result = write_archive(root, file, ignore, limit, over.clone()).map_err(|e| match limit {
+        Some(limit) if over.load(Ordering::Relaxed) => anyhow::Error::new(OverBudget { limit }),
+        _ => e,
+    });
     if result.is_err() {
         // Недописанный архив выглядит как бэкап, а восстановить из него можно
         // только половину мира.
@@ -125,10 +152,22 @@ fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
     result
 }
 
-fn write_archive(root: &Path, file: std::fs::File, ignore: &[String]) -> Result<BackupResult> {
+fn write_archive(
+    root: &Path,
+    file: std::fs::File,
+    ignore: &[String],
+    limit: Option<u64>,
+    over: Arc<AtomicBool>,
+) -> Result<BackupResult> {
     // Хеш и размер считаются по ходу записи: перечитывать готовый архив ради
     // них — это ещё раз весь мир с диска.
-    let sink = Counting::new(std::io::BufWriter::new(file));
+    let sink = Counting {
+        inner: std::io::BufWriter::new(file),
+        hasher: sha2::Sha256::new(),
+        bytes: 0,
+        limit,
+        over,
+    };
     let mut tar = tar::Builder::new(GzEncoder::new(sink, Compression::default()));
 
     for entry in walkdir::WalkDir::new(root)
@@ -175,25 +214,26 @@ fn write_archive(root: &Path, file: std::fs::File, ignore: &[String]) -> Result<
     })
 }
 
-/// Запись, которая попутно считает байты и sha256.
+/// Запись, которая попутно считает байты и sha256 и обрывается на пределе.
 struct Counting<W> {
     inner: W,
     hasher: sha2::Sha256,
     bytes: u64,
-}
-
-impl<W> Counting<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            hasher: sha2::Sha256::new(),
-            bytes: 0,
-        }
-    }
+    limit: Option<u64>,
+    /// Поднимается, когда запись упёрлась в предел: ошибка ввода-вывода сама
+    /// по себе не отличает «кончилось отведённое» от «сломался диск».
+    over: Arc<AtomicBool>,
 }
 
 impl<W: Write> Write for Counting<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self
+            .limit
+            .is_some_and(|limit| self.bytes.saturating_add(buf.len() as u64) > limit)
+        {
+            self.over.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::other("архив перерос отведённое место"));
+        }
         let n = self.inner.write(buf)?;
         self.hasher.update(&buf[..n]);
         self.bytes += n as u64;
@@ -244,7 +284,7 @@ mod tests {
         std::fs::write(root.join("server.properties"), b"motd=x").unwrap();
         let dest = base.join("b.tar.gz");
 
-        let r = pack(&root, &dest, &[]).unwrap();
+        let r = pack(&root, &dest, &[], None).unwrap();
         let bytes = std::fs::read(&dest).unwrap();
         assert_eq!(r.bytes, bytes.len() as u64);
         assert_eq!(r.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
@@ -269,13 +309,32 @@ mod tests {
         std::os::unix::fs::symlink(base.join("noded.toml"), root.join("cfg.toml")).unwrap();
         let dest = base.join("b.tar.gz");
 
-        pack(&root, &dest, &[]).unwrap();
+        pack(&root, &dest, &[], None).unwrap();
         let bytes = std::fs::read(&dest).unwrap();
         let count = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]))
             .entries()
             .unwrap()
             .count();
         assert_eq!(count, 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Архив, переросший отведённое место, не остаётся лежать огрызком, и
+    /// отказ узнаётся по типу, а не по тексту.
+    #[test]
+    fn an_archive_over_its_budget_is_cut_and_removed() {
+        let base = std::env::temp_dir().join(format!("noded-backup-{}", uuid::Uuid::new_v4()));
+        let root = base.join("server");
+        std::fs::create_dir_all(root.join("world")).unwrap();
+        // Случайные байты не сжимаются: архив гарантированно больше предела.
+        let mut noise = vec![0u8; 256 * 1024];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut noise[..]);
+        std::fs::write(root.join("world/region.mca"), noise).unwrap();
+        let dest = base.join("b.tar.gz");
+
+        let err = pack(&root, &dest, &[], Some(16 * 1024)).unwrap_err();
+        assert!(err.downcast_ref::<OverBudget>().is_some(), "{err:#}");
+        assert!(!dest.exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 

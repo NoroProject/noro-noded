@@ -33,7 +33,7 @@ pub async fn restore(
         }
     }
 
-    if !archive.exists() {
+    if std::fs::symlink_metadata(archive).is_err() {
         bail!("архива нет на этой ноде");
     }
 
@@ -52,8 +52,8 @@ fn unpack_into(root: &Path, archive: &Path) -> Result<()> {
 }
 
 fn unpack_files(root: &Path, archive: &Path) -> Result<()> {
-    // Архив лежит в служебном каталоге, а его процесс сервера тоже может
-    // переписать: открывается он так же, как любой файл сервера.
+    // Архив мог приехать из хранилища или от прежней раскладки, когда он
+    // лежал в папке сервера: открывается он так же, как любой файл сервера.
     let file = crate::fs::nofollow::open_existing(archive, false)?;
     let mut tar = tar::Archive::new(GzDecoder::new(std::io::BufReader::new(file)));
 

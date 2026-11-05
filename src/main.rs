@@ -207,9 +207,9 @@ const STATS_PARALLEL: usize = 8;
 /// Убрать временные файлы оборванных до рестарта операций — в фоне, по
 /// одному серверу: это обход каталогов, и старт демона он ждать не должен.
 fn spawn_sweep(daemon: &Daemon) {
-    let servers = daemon.cfg.data_dir.join("servers");
+    let cfg = daemon.cfg.clone();
     tokio::task::spawn_blocking(move || {
-        let Ok(dirs) = std::fs::read_dir(&servers) else {
+        let Ok(dirs) = std::fs::read_dir(cfg.data_dir.join("servers")) else {
             return;
         };
         for dir in dirs.flatten() {
@@ -219,6 +219,24 @@ fn spawn_sweep(daemon: &Daemon) {
             let removed = fs::sweep::sweep(&dir.path(), fs::sweep::MIN_AGE);
             if removed > 0 {
                 tracing::info!(server = %dir.file_name().to_string_lossy(), removed, "убраны недописанные временные файлы");
+            }
+            let Some(server) = dir
+                .file_name()
+                .to_str()
+                .and_then(|n| Uuid::parse_str(n).ok())
+            else {
+                continue;
+            };
+            // Архивы прежней раскладки переносятся сразу, а не при первом
+            // бэкапе: пока они в папке сервера, до них дотягивается его процесс.
+            let backups = cfg.backup_dir(server);
+            match backup::store::prepare(&backups, &dir.path()) {
+                Ok(()) => {
+                    fs::sweep::sweep(&backups, fs::sweep::MIN_AGE);
+                }
+                Err(e) => {
+                    tracing::warn!(%server, error = %format!("{e:#}"), "каталог бэкапов не подготовлен")
+                }
             }
         }
     });

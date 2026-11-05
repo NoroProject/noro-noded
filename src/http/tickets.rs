@@ -22,7 +22,7 @@ use uuid::Uuid;
 pub enum Target {
     /// Файл сервера по относительному пути.
     File(String),
-    /// Архив бэкапа в служебном каталоге: файловому менеджеру он недоступен.
+    /// Архив бэкапа в каталоге бэкапов: файловому менеджеру он недоступен.
     Backup(Uuid),
 }
 
@@ -37,8 +37,9 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// Разрешить путь тикета внутри каталога сервера — сейчас, а не при выдаче.
-    pub fn path(&self, root: &Path) -> anyhow::Result<PathBuf> {
+    /// Разрешить путь тикета — сейчас, а не при выдаче. Файл ищется в каталоге
+    /// сервера `root`, архив — в каталоге его бэкапов `backups`.
+    pub fn path(&self, root: &Path, backups: &Path) -> anyhow::Result<PathBuf> {
         match &self.target {
             Target::File(rel) => {
                 if crate::fs::is_hidden(rel) {
@@ -49,7 +50,7 @@ impl Ticket {
                     TicketMode::Upload => crate::fs::resolve(root, rel)?,
                 })
             }
-            Target::Backup(backup) => Ok(crate::backup::archive_path(root, *backup)),
+            Target::Backup(backup) => Ok(crate::backup::store::archive_path(backups, *backup)),
         }
     }
 }

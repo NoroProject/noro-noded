@@ -154,8 +154,9 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             backup,
             ignore,
             upload,
+            quota_mb,
             ..
-        } => backup::create(daemon, server, backup, ignore, upload).await,
+        } => backup::create(daemon, server, backup, ignore, upload, quota_mb).await,
 
         NodeOp::BackupRestore {
             server,

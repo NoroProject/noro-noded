@@ -26,7 +26,14 @@ build rollout, backups, schedules and SFTP all travel over that one socket.
   stale files **only inside managed roots** — `world/`, `logs/` and the rest are
   never in scope.
 - **Backups.** `save-off` → `save-all flush` → tar → `save-on`: a tar of a live
-  world gives broken regions.
+  world gives broken regions. Archives live in `<data_dir>/backups/<server>/`,
+  outside the directory mounted into the container, so a plugin cannot delete or
+  swap a restore point. They have their own limit, set by the master, apart from
+  the server's disk quota.
+- **Crash fingerprints.** When a server crashes or is killed for memory, the
+  last 200 console lines and that run's `crash-reports/*.txt` are kept in
+  `<data_dir>/crashes/<server>/` (the last five), before the automatic restart
+  scrolls them away.
 - **SFTP.** `russh` on port 2022. Authentication is decided by the master: the
   list of keys never leaves it, so a compromised node cannot enumerate them.
 

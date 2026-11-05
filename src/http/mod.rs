@@ -120,7 +120,7 @@ async fn download(State(daemon): State<Daemon>, Path(token): Path<String>) -> Re
     // сервера мог положить на его место или на место каталога над ним ссылку
     // на файл хоста. Поэтому он разрешается заново, и открывается без ссылок.
     let root = daemon.cfg.server_dir(ticket.server);
-    let path = match ticket.path(&root) {
+    let path = match ticket.path(&root, &daemon.cfg.backup_dir(ticket.server)) {
         Ok(p) => p,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
@@ -170,7 +170,7 @@ async fn upload(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let root = daemon.cfg.server_dir(ticket.server);
-    let path = match ticket.path(&root) {
+    let path = match ticket.path(&root, &daemon.cfg.backup_dir(ticket.server)) {
         Ok(p) => p,
         Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
     };

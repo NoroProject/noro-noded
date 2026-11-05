@@ -131,11 +131,23 @@ pub async fn delete(daemon: &Daemon, server: Uuid, keep_files: bool) -> OpResult
     if !keep_files {
         let dir = daemon.cfg.server_dir(server);
         let _ = std::fs::remove_file(fs::quota::limits_path(&dir));
-        if dir.exists() {
-            blocking(move || Ok(std::fs::remove_dir_all(&dir)?))
-                .await
-                .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
-        }
+        // Архивы и отпечатки падений живут вне каталога сервера, но без него
+        // им незачем жить: прежде они уходили вместе с ним.
+        let leftovers = [
+            dir,
+            daemon.cfg.backup_dir(server),
+            daemon.cfg.crash_dir(server),
+        ];
+        blocking(move || {
+            for dir in leftovers {
+                if std::fs::symlink_metadata(&dir).is_ok() {
+                    fs::nofollow::remove(&dir)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
     }
     Ok(Value::Null)
 }

@@ -115,6 +115,20 @@ fn split(path: &Path) -> std::io::Result<(Dir, OsString)> {
     Ok((Dir::open(parent)?, name.to_owned()))
 }
 
+/// Создать каталог, если его нет, и открыть его сверенным.
+///
+/// Каталог создаётся внутри сверенного родителя, а уже существующий
+/// принимается, только если это настоящий каталог, а не ссылка на чужой.
+pub fn ensure_dir(path: &Path) -> std::io::Result<Dir> {
+    let (parent, name) = split(path)?;
+    match std::fs::create_dir(parent.entry(&name)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Dir::open(path)
+}
+
 /// Записать файл целиком.
 ///
 /// Байты ложатся во временный файл, созданный эксклюзивно рядом с целью, и он

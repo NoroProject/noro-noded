@@ -137,6 +137,20 @@ impl Config {
         self.data_dir.join("servers").join(id.to_string())
     }
 
+    /// Архивы бэкапов сервера.
+    ///
+    /// Рядом с каталогом сервера, а не в нём: тот примонтирован в контейнер, и
+    /// процесс сервера мог удалить точки восстановления или подменить архив
+    /// своим — а восстанавливают из него, когда мир уже испорчен.
+    pub fn backup_dir(&self, id: uuid::Uuid) -> PathBuf {
+        self.data_dir.join("backups").join(id.to_string())
+    }
+
+    /// Отпечатки падений сервера — по той же причине вне его каталога.
+    pub fn crash_dir(&self, id: uuid::Uuid) -> PathBuf {
+        self.data_dir.join("crashes").join(id.to_string())
+    }
+
     /// Тот же каталог глазами докера. Именно это уходит в bind контейнера.
     pub fn host_server_dir(&self, id: uuid::Uuid) -> PathBuf {
         self.host_data_dir

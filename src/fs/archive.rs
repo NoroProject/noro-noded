@@ -69,7 +69,7 @@ impl Sink {
                 if copied > room {
                     drop(out);
                     let _ = super::nofollow::remove(target);
-                    bail!("распакованное не помещается в квоту сервера");
+                    bail!("распакованное не помещается: кончилась квота сервера или место на ноде");
                 }
                 copied
             }

@@ -130,9 +130,31 @@ struct Entry {
 #[derive(Clone, Default)]
 pub struct Quota {
     inner: Arc<DashMap<Uuid, Entry>>,
+    /// Запас диска ноды поверх квот серверов. `None` — запаса нет.
+    reserve: Option<Arc<super::reserve::Reserve>>,
 }
 
 impl Quota {
+    pub fn with_reserve(reserve: super::reserve::Reserve) -> Self {
+        Self {
+            inner: Arc::default(),
+            reserve: Some(Arc::new(reserve)),
+        }
+    }
+
+    /// Сколько ещё можно записать на ноду, не трогая её запас.
+    pub fn node_room(&self) -> Option<u64> {
+        self.reserve.as_ref().map(|r| r.room())
+    }
+
+    /// Влезет ли `extra` байт в диск ноды за вычетом запаса.
+    pub fn node_fits(&self, extra: u64) -> Result<()> {
+        match &self.reserve {
+            Some(reserve) => reserve.fits(extra),
+            None => Ok(()),
+        }
+    }
+
     /// Текущее занятое место. Меряет заново, если последний замер протух.
     pub async fn usage(&self, server: Uuid, root: &Path) -> Usage {
         if let Some(entry) = self.cached(server) {
@@ -189,13 +211,17 @@ impl Quota {
     /// Без лимита разрешает всё: это не «безлимит по недосмотру», а сервер,
     /// заведённый до появления квоты, и отказывать ему задним числом нельзя.
     pub async fn check(&self, server: Uuid, root: &Path, extra: u64) -> Result<()> {
-        self.usage(server, root).await.fits(extra)
+        self.usage(server, root).await.fits(extra)?;
+        self.node_fits(extra)
     }
 
     /// Учесть записанное, не пересчитывая каталог заново.
     pub fn add(&self, server: Uuid, bytes: u64) {
         if let Some(mut entry) = self.inner.get_mut(&server) {
             entry.used_bytes = entry.used_bytes.saturating_add(bytes);
+        }
+        if let Some(reserve) = &self.reserve {
+            reserve.consume(bytes);
         }
     }
 

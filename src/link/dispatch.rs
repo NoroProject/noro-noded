@@ -440,15 +440,20 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
         } => {
             let root = daemon.cfg.server_dir(server);
             let usage = daemon.quota.usage(server, &root).await;
-            let budget =
+            let server_room =
                 (usage.limit_bytes > 0).then(|| usage.limit_bytes.saturating_sub(usage.used_bytes));
+            // Распаковка упирается и в квоту сервера, и в запас диска ноды.
+            let budget = match (server_room, daemon.quota.node_room()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let measured = root.clone();
             let result =
                 blocking(move || fs::archive::unpack_within(&root, &path, &dest_dir, budget))
                     .await
                     .map(|count| json!({ "count": count }))
                     .map_err(|e| {
-                        if e.to_string().contains("квоту") {
+                        if e.to_string().contains("не помещается") {
                             OpError::new("panel_disk_full", e.to_string())
                         } else {
                             fs_error(e)
@@ -580,6 +585,12 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
             ..
         } => {
             let root = daemon.cfg.server_dir(server);
+            // Размер архива заранее неизвестен, но начинать его на ноде, где
+            // свободен уже только запас, значит доесть место у живых серверов.
+            daemon
+                .quota
+                .node_fits(0)
+                .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
             let dest = crate::backup::archive_path(&root, backup);
             let r = crate::backup::create::create(&daemon.registry, &root, &dest, &ignore)
                 .await

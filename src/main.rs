@@ -116,7 +116,12 @@ async fn main() -> Result<()> {
         events: events_tx.clone(),
         sftp_fingerprint: Arc::new(parking_lot::Mutex::new(None)),
         http_tickets: http::Tickets::default(),
-        quota: fs::quota::Quota::default(),
+        quota: match cfg.disk_reserve_mb {
+            0 => fs::quota::Quota::default(),
+            mb => {
+                fs::quota::Quota::with_reserve(fs::reserve::Reserve::new(cfg.data_dir.clone(), mb))
+            }
+        },
         placeholders: Arc::new(dashmap::DashMap::new()),
         wake_gate: server::wake_gate::WakeGate::default(),
         busy: server::busy::Busy::default(),

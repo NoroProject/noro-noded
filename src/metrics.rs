@@ -34,6 +34,11 @@ pub fn available_memory_mb() -> i64 {
     (sys.available_memory() / 1024 / 1024) as i64
 }
 
+/// Сколько байт свободно на диске с каталогом данных.
+pub fn free_disk_bytes(data_dir: &Path) -> u64 {
+    data_disk(&Disks::new_with_refreshed_list(), data_dir).1
+}
+
 /// Замеры загрузки ноды.
 ///
 /// Загрузка процессора — разница двух замеров, и `System` обязан жить между

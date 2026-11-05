@@ -25,6 +25,11 @@ pub struct Config {
     pub http: HttpConfig,
     #[serde(default)]
     pub sftp: SftpConfig,
+    /// Сколько мегабайт на диске с каталогом данных не отдавать никому: при
+    /// меньшем остатке заливки, распаковки и скачивания получают отказ, чтобы
+    /// работающим серверам было куда сохраняться. Ноль — запаса нет.
+    #[serde(default = "default_disk_reserve_mb")]
+    pub disk_reserve_mb: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +58,10 @@ pub struct SftpConfig {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/noro-noded")
+}
+
+fn default_disk_reserve_mb() -> u64 {
+    2048
 }
 
 fn default_socket() -> String {
@@ -158,6 +167,7 @@ mod tests {
             docker: DockerConfig::default(),
             http: HttpConfig::default(),
             sftp: SftpConfig::default(),
+            disk_reserve_mb: default_disk_reserve_mb(),
         }
     }
 

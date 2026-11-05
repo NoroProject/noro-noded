@@ -5,6 +5,7 @@ pub mod io;
 pub mod list;
 pub mod nofollow;
 pub mod quota;
+pub mod reserve;
 pub mod safe;
 pub mod sweep;
 

@@ -176,7 +176,10 @@ async fn upload(
     // каждый пришедший кусок, и как только клиент врал про длину, каждый из
     // них норовил заново обойти каталог сервера целиком.
     let usage = daemon.quota.usage(ticket.server, &root).await;
-    if let Err(e) = usage.fits(declared) {
+    if let Err(e) = usage
+        .fits(declared)
+        .and_then(|_| daemon.quota.node_fits(declared))
+    {
         return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
     }
 
@@ -233,7 +236,10 @@ async fn upload(
         // Заголовку верить нельзя: длину можно не прислать вовсе или соврать,
         // поэтому предел проверяется и по ходу — но по уже снятому замеру.
         if written > declared {
-            if let Err(e) = usage.fits(written) {
+            if let Err(e) = usage
+                .fits(written)
+                .and_then(|_| daemon.quota.node_fits(written))
+            {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
             }

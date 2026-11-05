@@ -53,10 +53,21 @@ async fn attach_inner(
     *handle.writer.lock().await = Some(writer);
     handle.set_power(PowerState::Starting);
 
-    let _ = outbox.send(state_event(server, &handle, 0, None)).await;
+    offer(&outbox, state_event(server, &handle, 0, None));
 
     tokio::spawn(pump(engine, registry, handle, outbox, console_rx, server));
     Ok(())
+}
+
+/// Положить событие в очередь к мастеру, не дожидаясь места в ней.
+///
+/// Очередь разбирает только живое соединение. Пока мастера нет, она полна, и
+/// ожидание места останавливало чтение консоли — а непрочитанный вывод докер
+/// держит в трубе, пока процесс сервера не повиснет на записи в stdout. Сбой
+/// мастера замораживал игру на всех серверах ноды. Возвращает `false`, если
+/// событие пришлось выбросить.
+fn offer(outbox: &mpsc::Sender<NodeEvent>, event: NodeEvent) -> bool {
+    outbox.try_send(event).is_ok()
 }
 
 async fn pump(
@@ -67,20 +78,29 @@ async fn pump(
     mut console_rx: mpsc::Receiver<ConsoleBatch>,
     server: Uuid,
 ) {
+    // Строки, выброшенные из-за полной очереди, не пропадают бесследно: их
+    // число уходит со следующей пачкой тем же `skipped`, что и при переполнении
+    // кадра.
+    let mut dropped: u32 = 0;
     while let Some(batch) = console_rx.recv().await {
         if !handle.state().ready && batch.lines.iter().any(|l| console::marks_ready(l)) {
             handle.set_ready();
             handle.set_power(PowerState::Running);
-            let _ = outbox.send(state_event(server, &handle, 0, None)).await;
+            // Состояние догонит периодический опрос, если сейчас не влезло.
+            offer(&outbox, state_event(server, &handle, 0, None));
         }
 
-        let _ = outbox
-            .send(NodeEvent::Console {
-                server,
-                lines: batch.lines,
-                skipped: batch.skipped,
-            })
-            .await;
+        let lost = batch.lines.len() as u32 + batch.skipped;
+        let event = NodeEvent::Console {
+            server,
+            lines: batch.lines,
+            skipped: batch.skipped.saturating_add(dropped),
+        };
+        if offer(&outbox, event) {
+            dropped = 0;
+        } else {
+            dropped = dropped.saturating_add(lost);
+        }
     }
 
     // Поток закрыт — контейнер больше не пишет. Чем это кончилось, знает докер.
@@ -93,16 +113,19 @@ async fn pump(
     let stopped_by_user = handle.state().stopped_on_purpose;
     *handle.writer.lock().await = None;
 
-    let _ = outbox
-        .send(NodeEvent::ServerState {
+    // Без ожидания и здесь: подъём упавшего сервера ниже не должен ждать,
+    // пока вернётся мастер.
+    offer(
+        &outbox,
+        NodeEvent::ServerState {
             server,
             state: power,
             ready: false,
             uptime_secs: uptime,
             exit_code,
             stopped_by_user,
-        })
-        .await;
+        },
+    );
 
     // Долгая работа до падения — причина случайная, и прошлые попытки не в счёт.
     if uptime >= STABLE_AFTER_SECS {
@@ -132,16 +155,17 @@ async fn try_restart(
 
     let pause = backoff(attempt);
     tracing::info!(%server, ?power, attempt, secs = pause.as_secs(), "поднимаю упавший сервер");
-    let _ = outbox
-        .send(NodeEvent::Console {
+    offer(
+        &outbox,
+        NodeEvent::Console {
             server,
             lines: vec![format!(
                 "[noro] сервер упал ({power:?}), подъём через {} с (попытка {attempt} из {MAX_RESTARTS})",
                 pause.as_secs()
             )],
             skipped: 0,
-        })
-        .await;
+        },
+    );
     tokio::time::sleep(pause).await;
 
     // Между падением и подъёмом человек мог погасить сервер сам — проверяем ещё раз.
@@ -157,13 +181,14 @@ async fn try_restart(
         }
         Err(e) => {
             tracing::warn!(%server, error = %e, "не поднять упавший сервер");
-            let _ = outbox
-                .send(NodeEvent::Console {
+            offer(
+                &outbox,
+                NodeEvent::Console {
                     server,
                     lines: vec![format!("[noro] подъём не удался: {e}")],
                     skipped: 0,
-                })
-                .await;
+                },
+            );
         }
     }
 }

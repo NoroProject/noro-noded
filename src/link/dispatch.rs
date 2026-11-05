@@ -648,6 +648,9 @@ async fn attach(daemon: &Daemon, server: Uuid) -> OpResult {
 
 /// Лог установки уходит тем же каналом, что консоль: панель показывает его в
 /// том же окне, а не оставляет пользователя смотреть на крутилку десять минут.
+///
+/// Без ожидания места в очереди: пока мастера нет, она полна, и ожидание
+/// останавливало саму установку на первой же строке лога.
 fn spawn_install_log(
     events: mpsc::Sender<NodeEvent>,
     mut rx: mpsc::Receiver<String>,
@@ -655,12 +658,10 @@ fn spawn_install_log(
 ) {
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
-            let _ = events
-                .send(NodeEvent::InstallLog {
-                    server,
-                    lines: vec![line],
-                })
-                .await;
+            let _ = events.try_send(NodeEvent::InstallLog {
+                server,
+                lines: vec![line],
+            });
         }
     });
 }

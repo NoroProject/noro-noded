@@ -298,21 +298,36 @@ pub async fn handle(daemon: &Daemon, op: NodeOp) -> OpResult {
         } => {
             let root = daemon.cfg.server_dir(server);
             let path = fs::resolve(&root, &dest).map_err(|e| fs_error(e.into()))?;
-            if path.is_file() {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if crate::server::sync::file_sha1(&path)
-                        .is_ok_and(|hash| hash.eq_ignore_ascii_case(&sha1))
-                    {
-                        return Ok(json!({ "bytes": meta.len(), "cached": true }));
-                    }
+            let cached = path.clone();
+            let have = blocking(move || {
+                let len = std::fs::symlink_metadata(&cached)?.len();
+                Ok((len, crate::server::sync::file_sha1(&cached)?))
+            })
+            .await;
+            if let Ok((len, hash)) = have {
+                if hash.eq_ignore_ascii_case(&sha1) {
+                    return Ok(json!({ "bytes": len, "cached": true }));
                 }
             }
+            // Заливка по ссылке занимает место так же, как через браузер.
             daemon
+                .quota
+                .check(server, &root, 0)
+                .await
+                .map_err(|e| OpError::new("panel_disk_full", e.to_string()))?;
+            let pulled = daemon
                 .master
                 .download(&url, &path, Some(&sha1), None)
                 .await
                 .map(|bytes| json!({ "bytes": bytes }))
-                .map_err(|e| OpError::new("upstream_failed", e.to_string()))
+                .map_err(|e| OpError::new("upstream_failed", e.to_string()));
+            if pulled.is_ok() {
+                if let Err(e) = crate::server::layout::chown_path(&path) {
+                    tracing::warn!(%server, error = %e, "скачанный файл остался с чужим владельцем");
+                }
+            }
+            daemon.quota.measure(server, &root).await;
+            pulled
         }
 
         // Упаковка и распаковка идут в блокирующем пуле: архив каталога с

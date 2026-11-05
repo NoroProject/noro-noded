@@ -33,13 +33,11 @@ pub async fn install(master: &MasterClient, root: &Path, spec: &AgentSpec) -> Re
         std::fs::create_dir_all(parent)?;
     }
 
-    if path.is_file() {
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if crate::server::sync::file_sha1(&path)
-                .is_ok_and(|hash| hash.eq_ignore_ascii_case(&spec.sha1))
-            {
-                return Ok(meta.len());
-            }
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if crate::server::sync::file_sha1(&path)
+            .is_ok_and(|hash| hash.eq_ignore_ascii_case(&spec.sha1))
+        {
+            return Ok(meta.len());
         }
     }
 

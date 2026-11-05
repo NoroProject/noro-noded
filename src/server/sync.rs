@@ -71,7 +71,7 @@ pub async fn run(
 /// Размер сравнивается первым: он бесплатный, и на модпаке в четыреста файлов
 /// это разница между секундой и минутой чтения диска.
 fn up_to_date(path: &Path, file: &FileEntry) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
     if meta.len() != file.size {
@@ -151,8 +151,11 @@ fn is_kept(rel: &str, policy: &SyncPolicy) -> bool {
         .any(|keep| rel == keep || rel.starts_with(&format!("{keep}/")))
 }
 
+/// Хеш обычного файла. Ссылку не разворачивает: путь лежит в каталоге
+/// сервера, и ссылка на файл хоста превращала проверку «уже скачано» в чтение
+/// этого файла от root — а `/dev/zero` в бесконечное.
 pub fn file_sha1(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::fs::nofollow::open_existing(path, false)?;
     let mut hasher = sha1::Sha1::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
@@ -161,9 +164,12 @@ pub fn file_sha1(path: &Path) -> Result<String> {
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
+    // Через открытый файл, а не по пути: `chmod` идёт по ссылке, подложенной
+    // на место только что скачанного файла.
+    let file = crate::fs::nofollow::open_existing(path, false)?;
+    let mut perms = file.metadata()?.permissions();
     perms.set_mode(perms.mode() | 0o111);
-    std::fs::set_permissions(path, perms)?;
+    file.set_permissions(perms)?;
     Ok(())
 }
 

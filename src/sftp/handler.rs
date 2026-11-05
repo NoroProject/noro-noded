@@ -116,10 +116,13 @@ impl SftpSession {
             action,
             path: path.to_string(),
         };
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let _ = events.send(event).await;
-        });
+        // Без ожидания места в очереди: пока мастера нет, она полна, и каждая
+        // запись оставляла висеть свою задачу — сессия, перекладывающая
+        // тысячи файлов, копила их тысячами, и память росла, пока мастер не
+        // вернётся. Не влезшая запись теряется, как и строка консоли.
+        if self.events.try_send(event).is_err() {
+            tracing::debug!(server = %self.grant.panel_server_id, "запись журнала SFTP не влезла в очередь к мастеру");
+        }
     }
 
     fn ok(id: u32) -> Status {

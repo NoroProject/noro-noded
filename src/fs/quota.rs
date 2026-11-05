@@ -1,9 +1,11 @@
 // Файл превышает 150 строк: замер, кэш и проверка лимита — одна механика, и порознь она не читается.
 //! Сколько места занимает сервер и можно ли писать ещё.
 //!
-//! Докеровский `--storage-opt size=` не годится: он работает только на overlay2
-//! поверх xfs с pquota, то есть на меньшинстве машин. Поэтому место меряется
-//! обходом каталога, а лимит применяется нами — зато одинаково везде.
+//! Где том поддерживает project quota, лимит держит ядро, а занятое оно же и
+//! сообщает (`project.rs`). Иначе место меряется обходом каталога, а лимит
+//! применяется нами — только к своим записям, зато одинаково везде.
+//! Докеровский `--storage-opt size=` не годится ни там ни там: он про слой
+//! контейнера, а мир лежит в bind-маунте.
 //!
 //! Обход каталога с миром стоит секунды, поэтому он кэшируется, а записи между
 //! замерами добавляются к последнему числу. Кэш врёт в безопасную сторону:
@@ -17,6 +19,7 @@
 
 use anyhow::{bail, Result};
 use dashmap::DashMap;
+use schema::noded::DiskQuotaDiag;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +38,10 @@ const LEGACY_LIMITS_FILE: &str = "limits.json";
 pub struct Limits {
     /// Ноль — лимита нет: так ведут себя серверы, заведённые до появления квоты.
     pub disk_mb: i64,
+    /// Номер проекта, которым помечен каталог. Пишется, только когда весь
+    /// каталог помечен: оборванное назначение повторится целиком.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<u32>,
 }
 
 /// Где лежат лимиты: рядом с каталогом сервера, а не в нём.
@@ -125,6 +132,8 @@ struct Entry {
     used_bytes: u64,
     limit_bytes: u64,
     measured_at: Instant,
+    /// Число от ядра, а не от обхода: его не кэшируют, спросить дешевле.
+    live: bool,
 }
 
 #[derive(Clone, Default)]
@@ -132,6 +141,9 @@ pub struct Quota {
     inner: Arc<DashMap<Uuid, Entry>>,
     /// Запас диска ноды поверх квот серверов. `None` — запаса нет.
     reserve: Option<Arc<super::reserve::Reserve>>,
+    /// Project quota тома; `None` — обход каталога.
+    projects: Option<Arc<super::project::Projects>>,
+    mode: Option<Arc<DiskQuotaDiag>>,
 }
 
 impl Quota {
@@ -142,17 +154,72 @@ impl Quota {
         }
     }
 
-    /// Новый лимит сервера: на диск рядом с ним и заново замерить. Сразу, без
-    /// пересборки контейнера.
+    pub fn with_projects(
+        mut self,
+        projects: Option<super::project::Projects>,
+        mode: DiskQuotaDiag,
+    ) -> Self {
+        self.projects = projects.map(Arc::new);
+        self.mode = Some(Arc::new(mode));
+        self
+    }
+
+    pub fn mode(&self) -> Option<DiskQuotaDiag> {
+        self.mode.as_deref().cloned()
+    }
+
+    /// Новый лимит сервера: на диск рядом с ним, ядру — если квота его, — и
+    /// заново замерить. Сразу, без пересборки контейнера.
     pub async fn set_limit(&self, server: Uuid, root: &Path, disk_mb: i64) -> Result<Usage> {
         let path = root.to_path_buf();
+        let projects = self.projects.clone();
         tokio::task::spawn_blocking(move || {
             let mut limits = read_limits(&path);
             limits.disk_mb = disk_mb;
-            write_limits(&path, &limits)
+            // Сначала файл: не выйдет у ядра — лимит всё равно держит обход.
+            write_limits(&path, &limits)?;
+            if let Some(projects) = projects {
+                match projects.apply(server, &path, &mut limits) {
+                    Ok(()) => write_limits(&path, &limits)?,
+                    Err(e) => {
+                        tracing::warn!(%server, error = %e, "project quota не назначена, остаётся обход")
+                    }
+                }
+            }
+            anyhow::Ok(())
         })
         .await??;
         Ok(self.measure(server, root).await)
+    }
+
+    /// Сервер, заведённый до project quota, переводится на неё при старте
+    /// демона. Блокирующее: первое назначение обходит каталог.
+    pub fn adopt(&self, server: Uuid, root: &Path) {
+        let Some(projects) = &self.projects else {
+            return;
+        };
+        if !limits_path(root).exists() {
+            return;
+        }
+        let mut limits = read_limits(root);
+        if limits.project_id.is_some() {
+            return;
+        }
+        let result = projects
+            .apply(server, root, &mut limits)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| write_limits(root, &limits));
+        match result {
+            Ok(()) => tracing::info!(%server, "сервер переведён на project quota"),
+            Err(e) => tracing::warn!(%server, error = %e, "сервер остался на обходе каталога"),
+        }
+    }
+
+    /// Сервер удаляется: снять лимит его проекта, пока номер ещё записан.
+    pub fn release(&self, root: &Path) {
+        if let (Some(projects), Some(id)) = (&self.projects, read_limits(root).project_id) {
+            projects.release(id);
+        }
     }
 
     /// Сколько ещё можно записать на ноду, не трогая её запас.
@@ -186,7 +253,7 @@ impl Quota {
 
     fn cached(&self, server: Uuid) -> Option<Usage> {
         let entry = self.inner.get(&server)?;
-        (entry.measured_at.elapsed() < TTL).then_some(Usage {
+        (!entry.live && entry.measured_at.elapsed() < TTL).then_some(Usage {
             used_bytes: entry.used_bytes,
             limit_bytes: entry.limit_bytes,
         })
@@ -196,12 +263,19 @@ impl Quota {
     /// протухания кэша незачем.
     pub async fn measure(&self, server: Uuid, root: &Path) -> Usage {
         let path = root.to_path_buf();
+        let projects = self.projects.clone();
         let measured = tokio::task::spawn_blocking(move || {
-            (dir_size(&path), read_limits(&path).disk_mb.max(0) as u64)
+            let limits = read_limits(&path);
+            let live = match (projects, limits.project_id) {
+                (Some(projects), Some(id)) => projects.usage(id).ok(),
+                _ => None,
+            };
+            let used = live.unwrap_or_else(|| dir_size(&path));
+            (used, limits.disk_mb.max(0) as u64, live.is_some())
         })
         .await;
 
-        let Ok((used_bytes, limit_mb)) = measured else {
+        let Ok((used_bytes, limit_mb, live)) = measured else {
             // Задача обхода не доехала. Прежнее число честнее нуля: с нулём
             // сервер, у которого место кончилось, снова начал бы принимать
             // заливки.
@@ -219,6 +293,7 @@ impl Quota {
                 used_bytes,
                 limit_bytes,
                 measured_at: Instant::now(),
+                live,
             },
         );
         Usage {

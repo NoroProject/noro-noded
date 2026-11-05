@@ -11,7 +11,14 @@ impl Sandbox {
         let root = std::env::temp_dir().join(format!("noded-quota-{}", Uuid::new_v4()));
         std::fs::create_dir_all(root.join("world")).unwrap();
         if disk_mb > 0 {
-            write_limits(&root, &Limits { disk_mb }).unwrap();
+            write_limits(
+                &root,
+                &Limits {
+                    disk_mb,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
         }
         Self { root }
     }

@@ -31,6 +31,10 @@ pub struct Config {
     /// работающим серверам было куда сохраняться. Ноль — запаса нет.
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
+    /// Держать квоту диска средствами ФС (project quota на xfs/ext4), если
+    /// она включена на томе с каталогом данных. `false` — всегда обход.
+    #[serde(default = "yes")]
+    pub project_quota: bool,
     #[serde(default)]
     pub network: NetworkConfig,
 }
@@ -219,6 +223,7 @@ mod tests {
             http: HttpConfig::default(),
             sftp: SftpConfig::default(),
             disk_reserve_mb: default_disk_reserve_mb(),
+            project_quota: true,
             network: NetworkConfig::default(),
         }
     }
@@ -256,18 +261,19 @@ mod tests {
     /// Конфиг ноды, заведённой до изоляции, разбирается и получает её
     /// включённой: так её получают все новые контейнеры.
     #[test]
-    fn an_old_config_gets_isolation_on() {
+    fn an_old_config_gets_isolation_and_project_quota_on() {
         let c: Config = toml::from_str("master_url = \"https://m\"\ntoken = \"t\"\n").unwrap();
         assert!(c.network.isolation);
+        assert!(c.project_quota);
         assert_eq!(c.network.subnet_pool, "10.209.0.0/16");
         assert!(c.network.allow.is_empty());
 
         let c: Config = toml::from_str(
-            "master_url = \"https://m\"\ntoken = \"t\"\n\
+            "master_url = \"https://m\"\ntoken = \"t\"\nproject_quota = false\n\
              [network]\nisolation = false\nallow = [\"10.0.0.5:3306\"]\n",
         )
         .unwrap();
-        assert!(!c.network.isolation);
+        assert!(!c.network.isolation && !c.project_quota);
         assert_eq!(c.network.allow, vec!["10.0.0.5:3306"]);
     }
 

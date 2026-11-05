@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         &cfg,
         Arc::new(net::firewall::SystemIptables),
     )?);
+    let (projects, quota_mode) = fs::project::detect(&cfg.data_dir, cfg.project_quota);
     let master = MasterClient::new(&cfg.master_url, &cfg.token)?;
     let (events_tx, events_rx) = mpsc::channel::<NodeEvent>(1024);
 
@@ -129,7 +130,8 @@ async fn main() -> Result<()> {
             mb => {
                 fs::quota::Quota::with_reserve(fs::reserve::Reserve::new(cfg.data_dir.clone(), mb))
             }
-        },
+        }
+        .with_projects(projects, quota_mode),
         placeholders: Arc::new(dashmap::DashMap::new()),
         wake_gate: server::wake_gate::WakeGate::default(),
         busy: server::busy::Busy::default(),
@@ -178,6 +180,7 @@ fn spawn_firewall_repair(daemon: &Daemon) {
 /// одному серверу: это обход каталогов, и старт демона он ждать не должен.
 fn spawn_sweep(daemon: &Daemon) {
     let cfg = daemon.cfg.clone();
+    let quota = daemon.quota.clone();
     tokio::task::spawn_blocking(move || {
         let Ok(dirs) = std::fs::read_dir(cfg.data_dir.join("servers")) else {
             return;
@@ -197,6 +200,7 @@ fn spawn_sweep(daemon: &Daemon) {
             else {
                 continue;
             };
+            quota.adopt(server, &dir.path());
             // Архивы прежней раскладки переносятся сразу, а не при первом
             // бэкапе: пока они в папке сервера, до них дотягивается его процесс.
             let backups = cfg.backup_dir(server);

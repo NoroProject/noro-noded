@@ -107,7 +107,7 @@ fn diag(daemon: &Daemon) -> NodeDiag {
         },
         servers,
         network: Some(daemon.isolation.diag()),
-        disk_quota: None,
+        disk_quota: daemon.quota.mode(),
     }
 }
 

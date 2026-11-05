@@ -153,6 +153,7 @@ pub async fn delete(daemon: &Daemon, server: Uuid, keep_files: bool) -> OpResult
     daemon.quota.forget(server);
     if !keep_files {
         let dir = daemon.cfg.server_dir(server);
+        daemon.quota.release(&dir);
         let _ = std::fs::remove_file(fs::quota::limits_path(&dir));
         // Архивы и отпечатки падений живут вне каталога сервера, но без него
         // им незачем жить: прежде они уходили вместе с ним.

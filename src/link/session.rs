@@ -215,6 +215,9 @@ async fn hello(daemon: &Daemon) -> Result<FromNode> {
     if daemon.cfg.network.isolation {
         capabilities.push(caps::NET_ISOLATION.to_string());
     }
+    if daemon.quota.mode().is_some_and(|m| m.mode == "project") {
+        capabilities.push(caps::DISK_QUOTA.to_string());
+    }
     if daemon.cfg.http.public_url.is_some() {
         capabilities.push(caps::DIRECT_TRANSFER.to_string());
     }

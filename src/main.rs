@@ -149,27 +149,48 @@ async fn main() -> Result<()> {
 /// докер отдаёт счётчики с секундным шагом, а обход каталога под диск не
 /// бесплатен.
 fn spawn_server_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
+    use futures_util::StreamExt;
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+        // Докер отвечает на замер не сразу, а через секунду-две: ему нужна
+        // разница счётчиков. По одному серверу за раз двадцать серверов не
+        // укладывались в интервал, а пропущенные тики `interval` по умолчанию
+        // догоняет залпом — и опрос докера шёл без передышки. Теперь замеры
+        // идут по нескольку разом, а опоздавший тик просто сдвигается.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            for server in daemon.registry.ids() {
-                let up = daemon
-                    .registry
-                    .get(server)
-                    .map(|h| h.state().power.is_up())
-                    .unwrap_or(false);
-                if !up {
-                    continue;
-                }
-                let root = daemon.cfg.server_dir(server);
-                match daemon
-                    .engine
-                    .stats_with_disk(server, &daemon.quota, &root)
-                    .await
-                {
+            let up: Vec<_> = daemon
+                .registry
+                .ids()
+                .into_iter()
+                .filter(|server| {
+                    daemon
+                        .registry
+                        .get(*server)
+                        .is_some_and(|h| h.state().power.is_up())
+                })
+                .collect();
+            let samples = futures_util::stream::iter(up)
+                .map(|server| {
+                    let daemon = &daemon;
+                    async move {
+                        let root = daemon.cfg.server_dir(server);
+                        let stats = daemon
+                            .engine
+                            .stats_with_disk(server, &daemon.quota, &root)
+                            .await;
+                        (server, stats)
+                    }
+                })
+                .buffer_unordered(STATS_PARALLEL)
+                .collect::<Vec<_>>()
+                .await;
+            for (server, stats) in samples {
+                match stats {
                     Ok(stats) => {
-                        let _ = events.send(NodeEvent::Stats { server, stats }).await;
+                        let _ = events.try_send(NodeEvent::Stats { server, stats });
                     }
                     // Контейнер могли снять между перечислением и замером —
                     // это не повод шуметь в лог на каждом тике.
@@ -179,6 +200,9 @@ fn spawn_server_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
         }
     });
 }
+
+/// Сколько серверов меряется одновременно.
+const STATS_PARALLEL: usize = 8;
 
 /// Убрать временные файлы оборванных до рестарта операций — в фоне, по
 /// одному серверу: это обход каталогов, и старт демона он ждать не должен.
@@ -261,6 +285,7 @@ async fn start_sftp(daemon: &Daemon) {
 fn spawn_node_stats(daemon: Daemon, events: mpsc::Sender<NodeEvent>) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sampler = metrics::Sampler::new();
         loop {
             ticker.tick().await;

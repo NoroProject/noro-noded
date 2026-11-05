@@ -280,14 +280,44 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
         ..Default::default()
     };
 
+    // Контейнер с этим именем мог остаться от прошлой попытки, оборванной
+    // перезапуском демона, — и тогда каждая следующая установка падала на
+    // конфликте имён, пока его не снимут руками.
+    remove_installer(ctx.engine, &name).await;
     ctx.engine
         .docker
         .create_container(Some(options), body)
         .await?;
-    ctx.engine.docker.start_container(&name, None).await?;
+
+    // Установщик тянет библиотеки из интернета и на мёртвом зеркале висит
+    // сколько угодно; мастер перестаёт ждать через полчаса, а контейнер и
+    // задача оставались бы навсегда. Потолок чуть меньше мастерского.
+    let outcome = tokio::time::timeout(INSTALLER_TIMEOUT, follow_installer(ctx, &name)).await;
+    remove_installer(ctx.engine, &name).await;
+    let code = match outcome {
+        Ok(result) => result?,
+        Err(_) => bail!(
+            "установщик не уложился в {} минут",
+            INSTALLER_TIMEOUT.as_secs() / 60
+        ),
+    };
+
+    if code != 0 {
+        bail!("установщик вышел с кодом {code}");
+    }
+
+    find_installed_jar(&ctx.layout.root).context("установщик отработал, но запускать нечего")
+}
+
+/// Сколько установщику можно работать.
+const INSTALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 60);
+
+/// Запустить установщик, пересказывая его лог, и дождаться кода выхода.
+async fn follow_installer(ctx: &InstallCtx<'_>, name: &str) -> Result<i64> {
+    ctx.engine.docker.start_container(name, None).await?;
 
     let mut logs = ctx.engine.docker.logs(
-        &name,
+        name,
         Some(
             LogsOptionsBuilder::default()
                 .stdout(true)
@@ -309,7 +339,7 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
     let mut wait = ctx
         .engine
         .docker
-        .wait_container(&name, Some(WaitContainerOptionsBuilder::default().build()));
+        .wait_container(name, Some(WaitContainerOptionsBuilder::default().build()));
     let mut code = 0i64;
     while let Some(status) = wait.next().await {
         match status {
@@ -320,21 +350,18 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
             Err(e) => return Err(e.into()),
         }
     }
+    Ok(code)
+}
 
-    ctx.engine
+async fn remove_installer(engine: &Engine, name: &str) {
+    engine
         .docker
         .remove_container(
-            &name,
+            name,
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await
         .ok();
-
-    if code != 0 {
-        bail!("установщик вышел с кодом {code}");
-    }
-
-    find_installed_jar(&ctx.layout.root).context("установщик отработал, но запускать нечего")
 }
 
 /// Чем сервер запускается на самом деле.

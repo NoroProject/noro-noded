@@ -106,6 +106,8 @@ fn diag(daemon: &Daemon) -> NodeDiag {
             fingerprint: daemon.sftp_fingerprint.lock().clone(),
         },
         servers,
+        network: Some(daemon.isolation.diag()),
+        disk_quota: None,
     }
 }
 

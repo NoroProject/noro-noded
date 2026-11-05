@@ -99,6 +99,9 @@ pub struct InstallCtx<'a> {
     pub layout: &'a Layout,
     pub host_dir: &'a Path,
     pub server: Uuid,
+    /// Сеть сервера: установщик — чужой код, и до метаданных облака ему не
+    /// дотянуться так же, как самому серверу.
+    pub network: Option<&'a str>,
     /// Куда писать строки установки, чтобы панель показывала их живьём.
     pub log: mpsc::Sender<String>,
 }
@@ -214,6 +217,7 @@ pub async fn install(ctx: InstallCtx<'_>, spec: &InstallSpec) -> Result<InstallR
             server: ctx.server,
             spec: &spec_with_jar,
             host_dir: ctx.host_dir,
+            network: ctx.network,
         })
         .await
         .context("не создать контейнер")?;
@@ -274,6 +278,7 @@ async fn run_installer(ctx: &InstallCtx<'_>, spec: &InstallSpec, core: &str) -> 
         cmd: Some(cmd),
         host_config: Some(crate::docker::create::locked_down(HostConfig {
             binds: Some(vec![format!("{}:{CONTAINER_ROOT}", ctx.host_dir.display())]),
+            network_mode: ctx.network.map(str::to_string),
             // Установщику нужна сеть — он тянет библиотеки, — но не нужно
             // ничего сверх неё. Потолок процессов — потому что это чужой код:
             // без него форк-бомба в установщике клала бы всю машину.

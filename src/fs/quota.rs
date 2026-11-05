@@ -137,9 +137,22 @@ pub struct Quota {
 impl Quota {
     pub fn with_reserve(reserve: super::reserve::Reserve) -> Self {
         Self {
-            inner: Arc::default(),
             reserve: Some(Arc::new(reserve)),
+            ..Self::default()
         }
+    }
+
+    /// Новый лимит сервера: на диск рядом с ним и заново замерить. Сразу, без
+    /// пересборки контейнера.
+    pub async fn set_limit(&self, server: Uuid, root: &Path, disk_mb: i64) -> Result<Usage> {
+        let path = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut limits = read_limits(&path);
+            limits.disk_mb = disk_mb;
+            write_limits(&path, &limits)
+        })
+        .await??;
+        Ok(self.measure(server, root).await)
     }
 
     /// Сколько ещё можно записать на ноду, не трогая её запас.

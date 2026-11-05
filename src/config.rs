@@ -31,6 +31,24 @@ pub struct Config {
     /// работающим серверам было куда сохраняться. Ноль — запаса нет.
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+/// Изоляция сети серверов — см. `net/rules.rs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkConfig {
+    /// Своя сеть у каждого нового или пересобранного контейнера и правила
+    /// фаервола поверх. Старые контейнеры получают её при пересборке.
+    #[serde(default = "yes")]
+    pub isolation: bool,
+    /// Откуда нарезаются подсети /28 под сети серверов. Не должен пересекаться
+    /// с сетями машины: маршрут в такую подсеть уйдёт в мост, а не наружу.
+    #[serde(default = "default_subnet_pool")]
+    pub subnet_pool: String,
+    /// Что серверам всё же можно: `10.0.0.5`, `10.0.0.0/24`, `10.0.0.5:3306`.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +83,14 @@ fn default_disk_reserve_mb() -> u64 {
     2048
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn default_subnet_pool() -> String {
+    "10.209.0.0/16".into()
+}
+
 fn default_socket() -> String {
     "/var/run/docker.sock".into()
 }
@@ -90,6 +116,16 @@ impl Default for HttpConfig {
         Self {
             bind: default_http_bind(),
             public_url: None,
+        }
+    }
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            isolation: true,
+            subnet_pool: default_subnet_pool(),
+            allow: Vec::new(),
         }
     }
 }
@@ -183,6 +219,7 @@ mod tests {
             http: HttpConfig::default(),
             sftp: SftpConfig::default(),
             disk_reserve_mb: default_disk_reserve_mb(),
+            network: NetworkConfig::default(),
         }
     }
 
@@ -214,6 +251,24 @@ mod tests {
             c.host_server_dir(id),
             PathBuf::from("/opt/noro/noded/servers").join(id.to_string())
         );
+    }
+
+    /// Конфиг ноды, заведённой до изоляции, разбирается и получает её
+    /// включённой: так её получают все новые контейнеры.
+    #[test]
+    fn an_old_config_gets_isolation_on() {
+        let c: Config = toml::from_str("master_url = \"https://m\"\ntoken = \"t\"\n").unwrap();
+        assert!(c.network.isolation);
+        assert_eq!(c.network.subnet_pool, "10.209.0.0/16");
+        assert!(c.network.allow.is_empty());
+
+        let c: Config = toml::from_str(
+            "master_url = \"https://m\"\ntoken = \"t\"\n\
+             [network]\nisolation = false\nallow = [\"10.0.0.5:3306\"]\n",
+        )
+        .unwrap();
+        assert!(!c.network.isolation);
+        assert_eq!(c.network.allow, vec!["10.0.0.5:3306"]);
     }
 
     #[test]

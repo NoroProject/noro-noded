@@ -188,6 +188,15 @@ async fn run(daemon: &Daemon, op: NodeOp) -> OpResult {
         }
 
         NodeOp::SftpReload => Ok(Value::Null),
+
+        NodeOp::NetworkGroups { groups } => daemon
+            .isolation
+            .set_groups(&daemon.engine, groups)
+            .await
+            .map(|_| serde_json::to_value(daemon.isolation.diag()).unwrap_or(Value::Null))
+            .map_err(|e| OpError::new("docker_failed", format!("{e:#}"))),
+
+        NodeOp::ServerLimits { server, disk_mb } => server::limits(daemon, server, disk_mb).await,
     }
 }
 

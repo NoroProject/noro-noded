@@ -143,3 +143,19 @@ async fn an_old_limit_is_carried_over_once() {
     assert!(limits_path(&s.root).exists(), "перенесён");
     assert!(!s.root.join(".noro/limits.json").exists());
 }
+
+/// Смена лимита в админке доходит до квоты сразу, без пересборки контейнера:
+/// прежде новый потолок ждал следующего `ServerUpdate`.
+#[tokio::test]
+async fn a_new_limit_applies_at_once() {
+    let s = Sandbox::new(10);
+    s.file("world/region.mca", 5 * 1024 * 1024);
+    let quota = Quota::default();
+    let server = Uuid::new_v4();
+    assert!(quota.check(server, &s.root, 1024 * 1024).await.is_ok());
+
+    let usage = quota.set_limit(server, &s.root, 5).await.unwrap();
+    assert_eq!(usage.limit_bytes, 5 * 1024 * 1024);
+    assert!(quota.check(server, &s.root, 1024 * 1024).await.is_err());
+    assert_eq!(read_limits(&s.root).disk_mb, 5);
+}

@@ -24,6 +24,9 @@ pub struct CreateArgs<'a> {
     pub spec: &'a ServerSpec,
     /// Каталог сервера **на хосте** — именно его резолвит докер.
     pub host_dir: &'a Path,
+    /// Своя сеть сервера; `None` — мост докера по умолчанию, как до изоляции.
+    /// Имя выводит демон из идентификатора, из API оно сюда не попадает.
+    pub network: Option<&'a str>,
 }
 
 impl Engine {
@@ -232,6 +235,7 @@ fn host_config(args: CreateArgs<'_>) -> HostConfig {
     }
 
     locked_down(HostConfig {
+        network_mode: args.network.map(str::to_string),
         // Ровно один маунт. Больше контейнеру знать о машине не положено.
         binds: Some(vec![format!(
             "{}:{CONTAINER_ROOT}",

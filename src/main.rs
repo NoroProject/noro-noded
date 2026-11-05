@@ -14,6 +14,7 @@ mod fs;
 mod http;
 mod link;
 mod metrics;
+mod net;
 mod sampling;
 mod server;
 mod sftp;
@@ -69,6 +70,8 @@ pub struct Daemon {
     pub busy: server::busy::Busy,
     /// Связь с мастером и прочее состояние самого демона.
     pub health: Arc<diag::Health>,
+    /// Сети серверов и правила фаервола поверх них.
+    pub isolation: Arc<net::isolation::Isolation>,
 }
 
 impl Daemon {
@@ -106,6 +109,10 @@ async fn main() -> Result<()> {
     let version = engine.version().await?;
     tracing::info!(docker = %version, data_dir = %cfg.data_dir.display(), "демон запускается");
 
+    let isolation = Arc::new(net::isolation::Isolation::new(
+        &cfg,
+        Arc::new(net::firewall::SystemIptables),
+    )?);
     let master = MasterClient::new(&cfg.master_url, &cfg.token)?;
     let (events_tx, events_rx) = mpsc::channel::<NodeEvent>(1024);
 
@@ -127,7 +134,13 @@ async fn main() -> Result<()> {
         wake_gate: server::wake_gate::WakeGate::default(),
         busy: server::busy::Busy::default(),
         health: Arc::new(diag::Health::default()),
+        isolation,
     };
+
+    // Правила — до первого сервера и до мастера: после перезагрузки машины
+    // фаервол пуст, а контейнеры поднимутся по первой же команде.
+    daemon.isolation.enforce(&daemon.engine).await;
+    spawn_firewall_repair(&daemon);
 
     // Переподключиться к тому, что уже работает, до первого кадра мастеру:
     // иначе консоль живого сервера молчала бы до его следующего рестарта.
@@ -141,6 +154,24 @@ async fn main() -> Result<()> {
     sampling::spawn_server_stats(daemon.clone(), events_tx);
 
     link::session::run(daemon, events_rx).await
+}
+
+/// Поставить правила изоляции заново раз в минуту: их стирают перезагрузка
+/// фаервола и руки, а ждать перезапуска демона нельзя.
+fn spawn_firewall_repair(daemon: &Daemon) {
+    if !daemon.isolation.enabled() {
+        return;
+    }
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            daemon.isolation.enforce(&daemon.engine).await;
+        }
+    });
 }
 
 /// Убрать временные файлы оборванных до рестарта операций — в фоне, по

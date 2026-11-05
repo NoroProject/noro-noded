@@ -32,6 +32,7 @@ fn args_for(spec: &ServerSpec) -> CreateArgs<'_> {
         server: uuid::Uuid::nil(),
         spec,
         host_dir: Path::new("/var/lib/noro-noded/servers/x"),
+        network: None,
     }
 }
 
@@ -174,6 +175,19 @@ fn exactly_one_bind_and_nothing_dangerous() {
     assert_eq!(
         hc.security_opt.as_deref(),
         Some(&["no-new-privileges:true".to_string()][..])
+    );
+}
+
+/// С изоляцией контейнер встаёт в свою сеть — ровно ту, что назвал демон.
+#[test]
+fn an_isolated_server_joins_its_own_network() {
+    let s = spec();
+    let mut args = args_for(&s);
+    args.network = Some("noro-net-00000000-0000-0000-0000-000000000000");
+    let hc = host_config(args);
+    assert_eq!(
+        hc.network_mode.as_deref(),
+        Some("noro-net-00000000-0000-0000-0000-000000000000")
     );
 }
 

@@ -43,15 +43,13 @@ pub async fn apply_spec(daemon: &Daemon, server: Uuid, spec: Box<ServerSpec>) ->
     }
     let mut spec = Box::new(spec);
 
-    // Лимит кладётся на диск рядом с сервером: демон перезапускается, а
-    // квота должна знать потолок и после этого — в памяти он бы пропал.
-    let limits = fs::quota::Limits {
-        disk_mb: spec.disk_mb,
-    };
-    if let Err(e) = fs::quota::write_limits(&layout.root, &limits) {
-        tracing::warn!(%server, error = %e, "лимит диска не записан");
+    if let Err(e) = daemon
+        .quota
+        .set_limit(server, &layout.root, spec.disk_mb)
+        .await
+    {
+        tracing::warn!(%server, error = %format!("{e:#}"), "лимит диска не применён");
     }
-    daemon.quota.measure(server, &layout.root).await;
 
     // Строка запуска ссылается на authlib-injector, а пересоздание
     // идёт мимо установки: без этой докачки контейнер, которому
@@ -60,6 +58,14 @@ pub async fn apply_spec(daemon: &Daemon, server: Uuid, spec: Box<ServerSpec>) ->
     install::ensure_authlib(&daemon.master, &layout, &spec)
         .await
         .map_err(|e| OpError::new("upstream_failed", format!("{e:#}")))?;
+
+    // Сеть — до того, как старый контейнер снят: без свободной подсети
+    // пересборка должна отказать, а не оставить сервер без контейнера.
+    let network = daemon
+        .isolation
+        .network_for(&daemon.engine, server)
+        .await
+        .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
 
     // Пересоздание вместо правки: докер не умеет менять лимиты живого
     // контейнера, а притворяться, что умеет, — значит разойтись с тем,
@@ -102,6 +108,7 @@ pub async fn apply_spec(daemon: &Daemon, server: Uuid, spec: Box<ServerSpec>) ->
             server,
             spec: &spec,
             host_dir: &daemon.cfg.host_server_dir(server),
+            network: network.as_deref(),
         })
         .await
         .map_err(|e| OpError::new("docker_failed", e.to_string()))?;
@@ -118,6 +125,21 @@ pub async fn apply_spec(daemon: &Daemon, server: Uuid, spec: Box<ServerSpec>) ->
     Ok(json!({ "jar": spec.jar }))
 }
 
+/// Новый лимит диска — сразу, без пересборки контейнера: квота живёт в
+/// файловой системе или в демоне, а не в настройках докера.
+pub async fn limits(daemon: &Daemon, server: Uuid, disk_mb: i64) -> OpResult {
+    let root = daemon.cfg.server_dir(server);
+    if !root.is_dir() {
+        return Err(OpError::new("not_found", "каталога сервера нет"));
+    }
+    let usage = daemon
+        .quota
+        .set_limit(server, &root, disk_mb)
+        .await
+        .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
+    Ok(json!({ "used_mb": usage.used_mb(), "limit_mb": usage.limit_bytes / 1024 / 1024 }))
+}
+
 pub async fn delete(daemon: &Daemon, server: Uuid, keep_files: bool) -> OpResult {
     // Держатель порта спящего сервера иначе переживал сам сервер и
     // занимал порт до перезапуска демона — новому серверу на этом
@@ -126,6 +148,7 @@ pub async fn delete(daemon: &Daemon, server: Uuid, keep_files: bool) -> OpResult
     if daemon.engine.exists(server).await {
         daemon.engine.remove(server).await.ok();
     }
+    daemon.isolation.forget(&daemon.engine, server).await;
     daemon.registry.forget(server);
     daemon.quota.forget(server);
     if !keep_files {
@@ -157,12 +180,18 @@ pub async fn install(daemon: &Daemon, server: Uuid, install: Box<InstallSpec>) -
     let (log_tx, log_rx) = mpsc::channel::<String>(64);
     spawn_install_log(daemon.events.clone(), log_rx, server);
 
+    let network = daemon
+        .isolation
+        .network_for(&daemon.engine, server)
+        .await
+        .map_err(|e| OpError::new("docker_failed", format!("{e:#}")))?;
     let ctx = install::InstallCtx {
         engine: &daemon.engine,
         master: &daemon.master,
         layout: &layout,
         host_dir: &daemon.cfg.host_server_dir(server),
         server,
+        network: network.as_deref(),
         log: log_tx,
     };
     install::install(ctx, &install)

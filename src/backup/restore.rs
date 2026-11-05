@@ -78,11 +78,11 @@ fn unpack_files(root: &Path, archive: &Path) -> Result<()> {
             continue;
         };
         if kind.is_dir() {
-            std::fs::create_dir_all(&target)?;
+            crate::fs::mkdir::create_dir_all(root, &target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::fs::mkdir::create_dir_all(root, parent)?;
         }
         let mut out = crate::fs::nofollow::create_replacing(&target)?;
         std::io::copy(&mut entry, &mut out)?;

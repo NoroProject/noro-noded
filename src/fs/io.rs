@@ -72,7 +72,7 @@ pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<std::path::Pa
     guard_hidden(rel)?;
     let path = super::resolve(root, rel)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        super::mkdir::create_dir_all(root, parent)?;
     }
     if path.exists() {
         // Существующий путь проверяем строже: за это время там мог появиться
@@ -90,7 +90,7 @@ pub fn write_text(root: &Path, rel: &str, content: &str) -> Result<std::path::Pa
 pub fn mkdir(root: &Path, rel: &str) -> Result<()> {
     guard_hidden(rel)?;
     let path = super::resolve(root, rel)?;
-    std::fs::create_dir_all(path)?;
+    super::mkdir::create_dir_all(root, &path)?;
     Ok(())
 }
 
@@ -115,7 +115,7 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
     // переименование ложилось поверх того, на что она указывала.
     let dst = super::resolve_entry(root, to)?;
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+        super::mkdir::create_dir_all(root, parent)?;
     }
     super::nofollow::rename(&src, &dst)?;
     Ok(())
@@ -139,7 +139,7 @@ pub fn copy(root: &Path, from: &str, to: &str) -> Result<u64> {
     }
     if src.is_file() {
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+            super::mkdir::create_dir_all(root, parent)?;
         }
         super::nofollow::copy_file(&src, &dst)?;
         return Ok(1);
@@ -151,7 +151,7 @@ pub fn copy(root: &Path, from: &str, to: &str) -> Result<u64> {
         let rel = entry.path().strip_prefix(&src)?;
         let target = dst.join(rel);
         if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
+            super::mkdir::create_dir_all(root, &target)?;
         } else if entry.file_type().is_file() {
             super::nofollow::copy_file(entry.path(), &target)?;
             count += 1;

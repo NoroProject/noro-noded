@@ -1934,6 +1934,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "libc",
  "parking_lot",
  "rand 0.10.2",
  "rand 0.8.8",

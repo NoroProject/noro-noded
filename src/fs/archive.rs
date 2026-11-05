@@ -100,11 +100,11 @@ fn unpack_zip(root: &Path, archive: &Path, dest_dir: &str, sink: &mut Sink) -> R
         };
 
         if entry.is_dir() {
-            std::fs::create_dir_all(&target)?;
+            super::mkdir::create_dir_all(root, &target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            super::mkdir::create_dir_all(root, parent)?;
         }
         sink.write(&target, &mut entry)?;
         written += 1;
@@ -134,11 +134,11 @@ fn unpack_tar(root: &Path, archive: &Path, dest_dir: &str, sink: &mut Sink) -> R
         };
 
         if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
+            super::mkdir::create_dir_all(root, &target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            super::mkdir::create_dir_all(root, parent)?;
         }
         sink.write(&target, &mut entry)?;
         written += 1;
@@ -159,7 +159,7 @@ pub fn pack(root: &Path, paths: &[String], dest: &str) -> Result<u64> {
     let root = root.canonicalize()?;
     let root = root.as_path();
     if let Some(parent) = archive.parent() {
-        std::fs::create_dir_all(parent)?;
+        super::mkdir::create_dir_all(root, parent)?;
     }
 
     let mut zip = zip::ZipWriter::new(BufWriter::new(super::nofollow::create_replacing(&archive)?));

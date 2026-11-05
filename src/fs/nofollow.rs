@@ -91,6 +91,19 @@ impl Dir {
     fn base(&self) -> PathBuf {
         self.path.clone()
     }
+
+    /// Свой дескриптор каталога — от него идут операции `*at`.
+    ///
+    /// Без закрепления (нет `/proc`) каталог открывается ещё раз, и уже без
+    /// перехода по ссылке на последнем шаге: проверка в [`Dir::open`] видела
+    /// каталог, а не ссылку, и подложенная после неё ссылка откажет здесь.
+    #[cfg(unix)]
+    pub(super) fn fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        match &self.pinned {
+            Some(file) => Ok(file.try_clone()?.into()),
+            None => super::mkdir::open_dir_at(None, self.path.as_os_str()),
+        }
+    }
 }
 
 fn through_link(path: &Path) -> std::io::Error {

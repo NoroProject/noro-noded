@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod io;
 pub mod list;
+pub mod mkdir;
 pub mod nofollow;
 pub mod pressure;
 pub mod quota;

@@ -58,6 +58,9 @@ tar = "0.4"
 flate2 = "1"
 zip = "2"
 walkdir = "2"
+# `mkdirat`/`openat` относительно открытого каталога: в std их нет, а каталоги
+# в папке сервера создаются только так — см. `fs/mkdir.rs`.
+libc = "0.2"
 dashmap = "6"
 parking_lot = "0.12"
 bytes = "1"

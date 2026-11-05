@@ -343,7 +343,12 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<Status, Self::Error> {
         self.require_write()?;
         let dir = self.resolve(&path)?;
-        blocking(|| std::fs::create_dir_all(dir).map_err(|_| StatusCode::Failure))?;
+        let root = self.root.clone();
+        blocking(move || {
+            crate::fs::mkdir::create_dir_all(&root, &dir)
+                .map(drop)
+                .map_err(|_| StatusCode::Failure)
+        })?;
         self.report(SftpActionKind::Mkdir, &path);
         Ok(Self::ok(id))
     }

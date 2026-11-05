@@ -170,7 +170,8 @@ async fn upload(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let root = daemon.cfg.server_dir(ticket.server);
-    let path = match ticket.path(&root, &daemon.cfg.backup_dir(ticket.server)) {
+    let backups = daemon.cfg.backup_dir(ticket.server);
+    let path = match ticket.path(&root, &backups) {
         Ok(p) => p,
         Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
     };
@@ -188,9 +189,6 @@ async fn upload(
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return (StatusCode::BAD_REQUEST, "no file name").into_response();
     };
-    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
 
     // Пишем во временный файл рядом и переименовываем: оборванная заливка
     // иначе оставляет обрезанный jar, который сервер пытается загрузить.
@@ -199,7 +197,18 @@ async fn upload(
     // эксклюзивно: заливка идёт минутами, и за это время процесс сервера мог
     // подменить каталог ссылкой на каталог хоста, а на месте временного файла
     // положить ссылку на файл хоста.
-    let dir = match crate::fs::nofollow::Dir::open(parent) {
+    //
+    // Недостающие каталоги создаются спуском от корня по дескрипторам: по
+    // пути они уходили бы туда, куда ведёт подложенная посередине ссылка.
+    // Каталог бэкапов лежит вне папки сервера и принадлежит демону — его
+    // создаём как обычно.
+    let dir = match &ticket.target {
+        tickets::Target::Backup(_) => {
+            std::fs::create_dir_all(parent).and_then(|_| crate::fs::nofollow::Dir::open(parent))
+        }
+        tickets::Target::File(_) => crate::fs::mkdir::create_dir_all(&root, parent),
+    };
+    let dir = match dir {
         Ok(d) => d,
         Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
     };

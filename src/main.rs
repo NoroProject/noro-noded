@@ -86,8 +86,14 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = Arc::new(Config::load(&cli.config)?);
+    let mut cfg = Config::load(&cli.config)?;
     std::fs::create_dir_all(cfg.data_dir.join("servers"))?;
+    // Канонический путь, а не как записали в конфиге: запись в каталог сервера
+    // сверяет настоящий путь открытого каталога с ожидаемым буквально, и
+    // ссылка где-то в пути к каталогу данных (`/srv -> /mnt/disk`) иначе
+    // выглядела бы подменой.
+    cfg.data_dir = cfg.data_dir.canonicalize()?;
+    let cfg = Arc::new(cfg);
 
     let engine = Engine::connect(&cfg.docker.socket)?;
     let version = engine.version().await?;

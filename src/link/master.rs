@@ -58,10 +58,15 @@ impl MasterClient {
         sha1: Option<&str>,
         sha256: Option<&str>,
     ) -> Result<u64> {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp = dest.with_extension("noro-part");
+        let parent = dest
+            .parent()
+            .context("у пути загрузки нет каталога")?
+            .to_path_buf();
+        let name = dest
+            .file_name()
+            .context("у пути загрузки нет имени файла")?
+            .to_owned();
+        tokio::fs::create_dir_all(&parent).await?;
 
         // Токен уходит только на свой же мастер: артефакты вроде ядра лежат на
         // чужих адресах, и Authorization туда слать незачем.
@@ -78,46 +83,69 @@ impl MasterClient {
             bail!("{url} ответил {}", response.status());
         }
 
-        // Каталог — чаще всего папка сервера, а её меняет процесс сервера:
-        // на месте предсказуемого `*.noro-part` могла лежать ссылка на файл
-        // хоста, и скачанное легло бы туда. Создаём эксклюзивно.
-        let _ = tokio::fs::remove_file(&tmp).await;
+        // Каталог — чаще всего папка сервера, а её меняет процесс сервера: на
+        // месте временного файла могла лежать ссылка на файл хоста, а сам
+        // каталог — оказаться ссылкой к концу закачки. Поэтому каталог
+        // закрепляется до неё, а временный файл создаётся в нём эксклюзивно.
+        let dir = crate::fs::nofollow::Dir::open(&parent)?;
+        let tmp = {
+            let mut tmp = std::ffi::OsString::from(".");
+            tmp.push(&name);
+            tmp.push(format!(".noro-part-{}", uuid::Uuid::new_v4().simple()));
+            dir.entry(tmp)
+        };
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
             .await?;
-        let mut sha1_hasher = sha1::Sha1::new();
-        let mut sha256_hasher = sha2::Sha256::new();
-        let mut size = 0u64;
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            size += chunk.len() as u64;
-            sha1_hasher.update(&chunk);
-            sha256_hasher.update(&chunk);
-            file.write_all(&chunk).await?;
+        // Имя временного файла случайное, и следующая попытка его не найдёт:
+        // оборванная закачка обязана убрать его сама, иначе каждая оставляла бы
+        // в папке сервера по недокачанному моду.
+        let fetched = async {
+            let mut sha1_hasher = sha1::Sha1::new();
+            let mut sha256_hasher = sha2::Sha256::new();
+            let mut size = 0u64;
+
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                size += chunk.len() as u64;
+                sha1_hasher.update(&chunk);
+                sha256_hasher.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+
+            if let Some(expected) = sha1 {
+                let got = hex::encode(sha1_hasher.finalize());
+                if !got.eq_ignore_ascii_case(expected) {
+                    bail!("sha1 не сошёлся: ждали {expected}, получили {got}");
+                }
+            }
+            if let Some(expected) = sha256 {
+                let got = hex::encode(sha256_hasher.finalize());
+                if !got.eq_ignore_ascii_case(expected) {
+                    bail!("sha256 не сошёлся: ждали {expected}, получили {got}");
+                }
+            }
+            Ok(size)
         }
-        file.flush().await?;
+        .await;
         drop(file);
-
-        if let Some(expected) = sha1 {
-            let got = hex::encode(sha1_hasher.finalize());
-            if !got.eq_ignore_ascii_case(expected) {
+        let size = match fetched {
+            Ok(size) => size,
+            Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                bail!("sha1 не сошёлся: ждали {expected}, получили {got}");
+                return Err(e).with_context(|| format!("не скачать {url}"));
             }
-        }
-        if let Some(expected) = sha256 {
-            let got = hex::encode(sha256_hasher.finalize());
-            if !got.eq_ignore_ascii_case(expected) {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                bail!("sha256 не сошёлся: ждали {expected}, получили {got}");
-            }
-        }
+        };
 
-        tokio::fs::rename(&tmp, dest).await?;
+        if let Err(e) = tokio::fs::rename(&tmp, dir.entry(&name)).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
         Ok(size)
     }
 }

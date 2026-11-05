@@ -233,12 +233,7 @@ impl russh_sftp::server::Handler for SftpSession {
             }
             file
         } else if pflags.contains(russh_sftp::protocol::OpenFlags::CREATE) {
-            std::fs::OpenOptions::new()
-                .read(pflags.contains(russh_sftp::protocol::OpenFlags::READ))
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|_| StatusCode::Failure)?
+            crate::fs::nofollow::create_new(&path).map_err(|_| StatusCode::Failure)?
         } else {
             return Err(StatusCode::NoSuchFile);
         };
@@ -342,7 +337,10 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
         let path = self.resolve_entry(&filename)?;
-        std::fs::remove_file(path).map_err(|_| StatusCode::Failure)?;
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            return Err(StatusCode::Failure);
+        }
+        crate::fs::nofollow::remove(&path).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Delete, &filename);
         Ok(Self::ok(id))
     }
@@ -350,7 +348,7 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
         let dir = self.resolve_entry(&path)?;
-        std::fs::remove_dir_all(dir).map_err(|_| StatusCode::Failure)?;
+        crate::fs::nofollow::remove(&dir).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Delete, &path);
         Ok(Self::ok(id))
     }
@@ -364,7 +362,7 @@ impl russh_sftp::server::Handler for SftpSession {
         self.require_write()?;
         let from = self.resolve_entry(&oldpath)?;
         let to = self.resolve_entry(&newpath)?;
-        std::fs::rename(from, to).map_err(|_| StatusCode::Failure)?;
+        crate::fs::nofollow::rename(&from, &to).map_err(|_| StatusCode::Failure)?;
         self.report(SftpActionKind::Rename, &newpath);
         Ok(Self::ok(id))
     }

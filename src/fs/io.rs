@@ -91,12 +91,7 @@ pub fn delete(root: &Path, rel: &str) -> Result<()> {
     // Симлинк удаляется как есть: снять подложенную ссылку должно быть можно,
     // даже если ходить по ней нельзя, а то, на что она ведёт, остаётся.
     let path = super::resolve_entry(root, rel)?;
-    let meta = std::fs::symlink_metadata(&path)?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
+    super::nofollow::remove(&path)?;
     Ok(())
 }
 
@@ -110,7 +105,7 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(src, dst)?;
+    super::nofollow::rename(&src, &dst)?;
     Ok(())
 }
 

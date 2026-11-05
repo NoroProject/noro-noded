@@ -153,19 +153,30 @@ async fn upload(
         return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response();
     }
 
-    if let Some(parent) = ticket.path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
+    let (Some(parent), Some(name)) = (ticket.path.parent(), ticket.path.file_name()) else {
+        return (StatusCode::BAD_REQUEST, "no file name").into_response();
+    };
+    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     // Пишем во временный файл рядом и переименовываем: оборванная заливка
     // иначе оставляет обрезанный jar, который сервер пытается загрузить.
-    let tmp = ticket.path.with_extension("noro-upload");
-    // Эксклюзивно: на месте временного файла процесс сервера мог заранее
-    // положить ссылку на файл хоста, и `create` записал бы заливку туда от
-    // имени демона. Свой же старый недописанный файл убирается перед этим.
-    let _ = tokio::fs::remove_file(&tmp).await;
+    //
+    // Каталог закрепляется до заливки, а временный файл создаётся в нём
+    // эксклюзивно: заливка идёт минутами, и за это время процесс сервера мог
+    // подменить каталог ссылкой на каталог хоста, а на месте временного файла
+    // положить ссылку на файл хоста.
+    let dir = match crate::fs::nofollow::Dir::open(parent) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    };
+    let tmp = {
+        let mut tmp = std::ffi::OsString::from(".");
+        tmp.push(name);
+        tmp.push(format!(".noro-upload-{}", uuid::Uuid::new_v4().simple()));
+        dir.entry(tmp)
+    };
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -208,7 +219,7 @@ async fn upload(
     }
     drop(file);
 
-    if let Err(e) = tokio::fs::rename(&tmp, &ticket.path).await {
+    if let Err(e) = tokio::fs::rename(&tmp, dir.entry(name)).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }

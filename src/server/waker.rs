@@ -32,6 +32,10 @@ const STATE_LOGIN: i32 = 2;
 /// Anything slower is a scanner, not a player.
 const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How many knocks are answered at once. The port is open to the internet, and
+/// a flood of connections otherwise turned into as many tasks and descriptors.
+const MAX_CLIENTS: usize = 64;
+
 /// A handle on the port held for a sleeping server.
 pub struct Placeholder {
     /// One-shot rather than a `Notify`: `notify_waiters` only reaches somebody
@@ -71,6 +75,7 @@ pub async fn hold(server: Uuid, port: u16, listing: Listing, wake: WakeFn) -> Re
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let (stop, mut stop_signal) = oneshot::channel();
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -79,10 +84,23 @@ pub async fn hold(server: Uuid, port: u16, listing: Listing, wake: WakeFn) -> Re
                     return;
                 }
                 accepted = listener.accept() => {
-                    let Ok((stream, addr)) = accepted else { continue };
+                    let (stream, addr) = match accepted {
+                        Ok(pair) => pair,
+                        // Out of descriptors, say: the error comes back at once
+                        // on every call, and retrying straight away spun a core.
+                        Err(e) => {
+                            tracing::debug!(%server, error = %e, "приём на порту не удался");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let Ok(slot) = slots.clone().try_acquire_owned() else {
+                        continue;
+                    };
                     let listing = listing.clone();
                     let wake = wake.clone();
                     tokio::spawn(async move {
+                        let _slot = slot;
                         match tokio::time::timeout(
                             CLIENT_TIMEOUT,
                             serve(stream, addr, &listing, server, wake),

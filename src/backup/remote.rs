@@ -47,7 +47,29 @@ impl S3Config {
     }
 }
 
+/// Сколько ждать хранилище, если оно не отвечает вовсе.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Потолок на всю передачу: пятнадцать минут плюс секунда на каждый мегабайт.
+///
+/// Ровные пятнадцать минут прежде обрывали заливку мира на двадцать гигабайт
+/// на середине, а без потолка зависшее хранилище держало бы задачу вечно.
+fn transfer_timeout(bytes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(900 + bytes / (1024 * 1024))
+}
+
+fn client(bytes: u64) -> Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(transfer_timeout(bytes))
+        .build()?)
+}
+
 /// Залить готовый архив во внешнее хранилище.
+///
+/// Архив читается потоком: прежде он целиком ложился в память демона, и бэкап
+/// большого мира заканчивался тем, что ядро убивало демон вместе с консолями
+/// всех серверов ноды.
 pub async fn upload(archive: &Path, target: &BackupUpload) -> Result<()> {
     if target.kind != "s3" {
         bail!("хранилище типа '{}' не поддерживается на ноде", target.kind);
@@ -56,18 +78,41 @@ pub async fn upload(archive: &Path, target: &BackupUpload) -> Result<()> {
         .context("неверная конфигурация S3 хранилища")?;
     let key = cfg.full_key(&target.path);
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .build()?;
-    let data = tokio::fs::read(archive)
-        .await
-        .context("не прочитать локальный архив бэкапа")?;
+    // Архив лежит в служебном каталоге сервера, и на его месте процесс
+    // сервера мог оставить ссылку на файл хоста — в чужое хранилище уехал бы
+    // он. Подпись S3 требует хеш тела заранее: он считается проходом по тому
+    // же открытому файлу, а не по пути.
+    let path = archive.to_path_buf();
+    let (file, size, content_sha256) = tokio::task::spawn_blocking(move || -> Result<_> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = crate::fs::nofollow::open_existing(&path, false)
+            .context("не открыть локальный архив бэкапа")?;
+        let mut hasher = Sha256::new();
+        let size = std::io::copy(&mut file, &mut hasher)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok((file, size, hex::encode(hasher.finalize())))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("чтение архива не выполнено: {e}"))??;
 
-    s3_put(&client, &cfg, &key, &data).await
+    let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
+    let body = Body {
+        inner: reqwest::Body::wrap_stream(stream),
+        size,
+        sha256: content_sha256,
+    };
+    s3_put(&client(size)?, &cfg, &key, body).await
 }
 
 /// Скачать архив из внешнего хранилища перед восстановлением.
+///
+/// Потоком во временный файл рядом и переименованием: целиком в памяти он не
+/// помещается, а оборванное скачивание не должно оставлять огрызок под именем
+/// настоящего архива.
 pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
     if source.kind != "s3" {
         bail!("хранилище типа '{}' не поддерживается на ноде", source.kind);
     }
@@ -75,30 +120,63 @@ pub async fn download(archive: &Path, source: &BackupUpload) -> Result<()> {
         .context("неверная конфигурация S3 хранилища")?;
     let key = cfg.full_key(&source.path);
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .build()?;
-    let bytes = s3_get(&client, &cfg, &key).await?;
-
-    if let Some(parent) = archive.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let (Some(parent), Some(name)) = (archive.parent(), archive.file_name()) else {
+        bail!("у пути архива нет имени");
+    };
+    tokio::fs::create_dir_all(parent).await?;
     // Мимо ссылок: каталог бэкапов внутри папки сервера.
-    let archive = archive.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::fs::nofollow::write(&archive, &bytes))
-        .await
-        .map_err(|e| anyhow::anyhow!("запись архива не выполнена: {e}"))??;
-    Ok(())
+    let dir = crate::fs::nofollow::Dir::open(parent)?;
+    let tmp = {
+        let mut tmp = std::ffi::OsString::from(".");
+        tmp.push(name);
+        tmp.push(format!(".noro-part-{}", uuid::Uuid::new_v4().simple()));
+        dir.entry(tmp)
+    };
+
+    // Размер заранее неизвестен — потолок по самому большому разумному миру.
+    let response = s3_get(&client(64 * 1024 * 1024 * 1024)?, &cfg, &key).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await?;
+    let written = async {
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.sync_all().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    drop(file);
+    let renamed = match written {
+        Ok(()) => tokio::fs::rename(&tmp, dir.entry(name))
+            .await
+            .map_err(anyhow::Error::from),
+        Err(e) => Err(e),
+    };
+    if renamed.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    renamed.context("ошибка скачивания из S3")
 }
 
-async fn s3_put(client: &Client, cfg: &S3Config, key: &str, data: &[u8]) -> Result<()> {
+/// Тело заливки: поток и то, что подписи нужно знать о нём заранее.
+struct Body {
+    inner: reqwest::Body,
+    size: u64,
+    sha256: String,
+}
+
+async fn s3_put(client: &Client, cfg: &S3Config, key: &str, body: Body) -> Result<()> {
     let now = Utc::now();
     let date = now.format("%Y%m%d").to_string();
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let host = endpoint_host(&cfg.endpoint);
     let path = format!("/{}/{}", cfg.bucket, key.trim_start_matches('/'));
-    let content_sha256 = hex::encode(Sha256::digest(data));
+    let content_sha256 = body.sha256;
     let content_type = "application/octet-stream";
 
     let canonical_headers = format!(
@@ -133,7 +211,8 @@ async fn s3_put(client: &Client, cfg: &S3Config, key: &str, data: &[u8]) -> Resu
         .header("x-amz-content-sha256", &content_sha256)
         .header("x-amz-date", &datetime)
         .header("authorization", &authorization)
-        .body(data.to_vec())
+        .header("content-length", body.size)
+        .body(body.inner)
         .send()
         .await
         .context("ошибка отправки запроса в S3")?;
@@ -146,7 +225,7 @@ async fn s3_put(client: &Client, cfg: &S3Config, key: &str, data: &[u8]) -> Resu
     Ok(())
 }
 
-async fn s3_get(client: &Client, cfg: &S3Config, key: &str) -> Result<Vec<u8>> {
+async fn s3_get(client: &Client, cfg: &S3Config, key: &str) -> Result<reqwest::Response> {
     let now = Utc::now();
     let date = now.format("%Y%m%d").to_string();
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -194,7 +273,7 @@ async fn s3_get(client: &Client, cfg: &S3Config, key: &str) -> Result<Vec<u8>> {
         let body = res.text().await.unwrap_or_default();
         bail!("S3 GET ошибка {status}: {body}");
     }
-    Ok(res.bytes().await?.to_vec())
+    Ok(res)
 }
 
 fn endpoint_host(endpoint: &str) -> String {

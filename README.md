@@ -14,6 +14,10 @@ build rollout, backups, schedules and SFTP all travel over that one socket.
 - **Containers.** Creates, starts, stops and rebuilds servers through the Docker
   API, with memory, CPU, pids and disk limits. Exactly one mount per container:
   the server's own directory.
+- **Network isolation.** Every server gets a Docker network of its own and
+  cannot reach the cloud metadata service, the host's ports or the other
+  servers of the node; the internet and its game ports stay open. A proxy and
+  the backends behind it are allowed to reach each other.
 - **Install.** Fetches the core (Paper, Fabric, NeoForge, Forge, Vanilla),
   runs loader installers **inside a throwaway container of the target image** —
   never on the host, because an installer is arbitrary code from the internet —
@@ -71,9 +75,45 @@ is only valid inside this container produces a silently empty mount.
 - `disk_reserve_mb` in the config (2048 by default, `0` to turn it off) is the
   space on the data disk that uploads, unpacking, downloads and backups never
   take, so running servers always have room to save their worlds.
+- **Disk quota.** When the data directory is on xfs or ext4 mounted with
+  `prjquota`, the kernel holds each server's limit — the server's own process
+  cannot write past it — and usage costs one system call. Otherwise the daemon
+  walks the directory and refuses only its own writes (uploads, unpacking).
+  `curl localhost:8444/status` shows which mode is on (`disk_quota`). To turn
+  project quota on for an ext4 volume, unmount it, run
+  `tune2fs -O quota,project <device>` and mount it with `prjquota` (in
+  `/etc/fstab`); a root volume needs this done from a rescue system. On xfs,
+  mounting with `prjquota` is enough. Set `project_quota = false` to stay on
+  the walk.
 - The daemon warns the master once when a server reaches 90% of its disk quota
   or the data disk reaches 90% of what the reserve leaves, and once more when it
   drops back under 85%.
+
+## Network isolation
+
+On by default for containers created or rebuilt by this version; older ones
+keep the default bridge until the panel rebuilds them. Each server's network
+is a bridge named `nr-<id>` with a /28 cut from `subnet_pool`, and two chains
+hang off those names:
+
+- `NORO-FWD`, jumped to first from `DOCKER-USER` (or `FORWARD` when Docker has
+  no `DOCKER-USER`), refuses 169.254.0.0/16, the private ranges and the other
+  servers — except DNS to the host's resolvers and the groups the master sends
+  (a proxy with its backends and limbos, through published ports);
+- `NORO-IN`, jumped to first from `INPUT` for `nr-+`, refuses everything the
+  host itself listens on.
+
+The daemon re-applies them every minute and at start, before anything else,
+so a reboot or `ufw reload` does not leave a gap. It needs `iptables` and
+`iptables-restore` on the host and the host's network namespace — the
+container mode above has neither, and keeps servers on the default bridge.
+
+```toml
+[network]
+isolation = true               # false takes the rules down at start
+subnet_pool = "10.209.0.0/16"  # must not overlap the machine's own networks
+allow = ["10.0.0.5:3306"]      # what servers may still reach: ip, cidr, :port
+```
 
 ## Security
 

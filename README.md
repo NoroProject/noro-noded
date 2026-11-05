@@ -54,6 +54,17 @@ docker run -d --name noro-noded --restart=always \
 thing to get wrong: `dockerd` resolves bind paths **on the host**, so a path that
 is only valid inside this container produces a silently empty mount.
 
+## Operations
+
+- `curl -s localhost:8444/status` on the node shows what the daemon itself
+  knows: whether the master link is up and when it last heard from it, how
+  many events are queued, how many console lines were dropped, and what each
+  server is doing. Only loopback clients get an answer; the master gets the
+  same report through `NodeInfo`.
+- `disk_reserve_mb` in the config (2048 by default, `0` to turn it off) is the
+  space on the data disk that uploads, unpacking and downloads never take, so
+  running servers always have room to save their worlds.
+
 ## Security
 
 The daemon holds `docker.sock`, which is root on the host. Nothing from the API

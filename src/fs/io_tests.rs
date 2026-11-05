@@ -73,3 +73,18 @@ fn renaming_onto_a_link_replaces_the_link() {
     assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"new");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_long_file_is_read_only_up_to_the_limit() {
+    let root = sandbox();
+    std::fs::write(root.join("latest.log"), "a".repeat(5000)).unwrap();
+    let head = read_text(&root, "latest.log", 1000).unwrap();
+    assert!(head.truncated);
+    assert_eq!(head.content.len(), 1000);
+    assert_eq!(head.size, 5000);
+
+    let whole = read_text(&root, "latest.log", 5000).unwrap();
+    assert!(!whole.truncated);
+    assert_eq!(whole.content.len(), 5000);
+    std::fs::remove_dir_all(root).unwrap();
+}

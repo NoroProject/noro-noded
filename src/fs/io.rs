@@ -18,10 +18,18 @@ fn looks_binary(bytes: &[u8]) -> bool {
 pub fn read_text(root: &Path, rel: &str, max_bytes: u64) -> Result<FileContent> {
     guard_hidden(rel)?;
     let path = super::resolve_existing(root, rel)?;
-    let meta = std::fs::metadata(&path)?;
+    let file = super::nofollow::open_existing(&path, false)?;
+    let meta = file.metadata()?;
     let limit = max_bytes.min(super::MAX_TEXT_BYTES);
 
-    let bytes = std::fs::read(&path)?;
+    // Читается только то, что уйдёт: `latest.log` на сотни мегабайт прежде
+    // целиком ложился в память демона ради первого мегабайта. Байт сверх
+    // предела нужен, чтобы отличить «ровно предел» от «длиннее».
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, limit.saturating_add(1)),
+        &mut bytes,
+    )?;
 
     // Содержимое двоичного файла не отдаём вовсе: показать jar «текстом» мало
     // того что бесполезно — сохранение такого «текста» уничтожит файл.
@@ -35,7 +43,7 @@ pub fn read_text(root: &Path, rel: &str, max_bytes: u64) -> Result<FileContent> 
         });
     }
 
-    let truncated = meta.len() > limit;
+    let truncated = meta.len() > limit || bytes.len() as u64 > limit;
     let slice = if truncated {
         &bytes[..limit as usize]
     } else {

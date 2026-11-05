@@ -1,3 +1,4 @@
+// Файл превышает 150 строк: тишина сервера на время упаковки, сама упаковка и её проверки — одна операция бэкапа.
 //! Упаковка сервера в архив.
 //!
 //! Живой мир нельзя просто затарить: Minecraft держит регионы открытыми и
@@ -9,6 +10,7 @@ use anyhow::{Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::Digest;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -114,12 +116,20 @@ fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
     // Каталог бэкапов лежит внутри папки сервера, а её меняет процесс сервера:
     // на месте архива могла оказаться ссылка на файл хоста.
     let file = crate::fs::nofollow::create_replacing(dest).context("не создать файл архива")?;
-    let encoder = GzEncoder::new(file, Compression::default());
-    let mut tar = tar::Builder::new(encoder);
-    // По умолчанию tar идёт по ссылкам и кладёт в архив то, на что они ведут.
-    // Ссылку на файл хоста в каталог сервера кладёт его же владелец, а бэкап
-    // потом скачивает — так он унёс бы конфиг ноды с её токеном.
-    tar.follow_symlinks(false);
+    let result = write_archive(root, file, ignore);
+    if result.is_err() {
+        // Недописанный архив выглядит как бэкап, а восстановить из него можно
+        // только половину мира.
+        let _ = crate::fs::nofollow::remove(dest);
+    }
+    result
+}
+
+fn write_archive(root: &Path, file: std::fs::File, ignore: &[String]) -> Result<BackupResult> {
+    // Хеш и размер считаются по ходу записи: перечитывать готовый архив ради
+    // них — это ещё раз весь мир с диска.
+    let sink = Counting::new(std::io::BufWriter::new(file));
+    let mut tar = tar::Builder::new(GzEncoder::new(sink, Compression::default()));
 
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -130,23 +140,69 @@ fn pack(root: &Path, dest: &Path, ignore: &[String]) -> Result<BackupResult> {
             continue;
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str.is_empty() || skipped(&rel_str, ignore) {
+        if rel_str.is_empty() || skipped(&rel_str, ignore) || !entry.file_type().is_file() {
             continue;
         }
 
-        if entry.file_type().is_file() {
-            tar.append_path_with_name(entry.path(), rel)?;
-        }
+        // Файл открывается без ссылок и в сверенном каталоге: обход идёт
+        // минутами, и ссылка, подложенная на место файла или каталога над ним,
+        // иначе уносила в архив файл хоста — например, конфиг ноды с её
+        // токеном, — а архив потом скачивает владелец сервера.
+        let source = match crate::fs::nofollow::open_existing(entry.path(), false) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(path = %rel_str, error = %e, "файл не попал в бэкап");
+                continue;
+            }
+        };
+        let meta = source.metadata()?;
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+        // Ровно столько байт, сколько записано в заголовке: файл живого
+        // сервера может вырасти или укоротиться посреди чтения, а запись другой
+        // длины ломает в tar всё, что идёт за ней.
+        let size = meta.len();
+        let body = source.take(size).chain(std::io::repeat(0)).take(size);
+        tar.append_data(&mut header, rel, body)?;
     }
 
-    tar.finish()?;
-    drop(tar);
-
-    let bytes = std::fs::metadata(dest)?.len();
+    let mut sink = tar.into_inner()?.finish()?;
+    sink.flush()?;
+    sink.inner.get_ref().sync_all()?;
     Ok(BackupResult {
-        sha256: sha256_of(dest)?,
-        bytes,
+        bytes: sink.bytes,
+        sha256: hex::encode(sink.hasher.finalize()),
     })
+}
+
+/// Запись, которая попутно считает байты и sha256.
+struct Counting<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+    bytes: u64,
+}
+
+impl<W> Counting<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for Counting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn skipped(rel: &str, ignore: &[String]) -> bool {
@@ -157,13 +213,6 @@ fn skipped(rel: &str, ignore: &[String]) -> bool {
     ignore
         .iter()
         .any(|pattern| schema::path_rules::matches(rel, pattern))
-}
-
-fn sha256_of(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -183,6 +232,51 @@ mod tests {
         assert!(!skipped("world/level.dat", &[]));
         assert!(!skipped("server.properties", &[]));
         assert!(!skipped("mods/jei.jar", &[]));
+    }
+
+    /// Хеш, посчитанный по ходу записи, — хеш того файла, что лёг на диск.
+    #[test]
+    fn the_archive_hash_matches_the_file() {
+        let base = std::env::temp_dir().join(format!("noded-backup-{}", uuid::Uuid::new_v4()));
+        let root = base.join("server");
+        std::fs::create_dir_all(root.join("world")).unwrap();
+        std::fs::write(root.join("world/level.dat"), b"lvl").unwrap();
+        std::fs::write(root.join("server.properties"), b"motd=x").unwrap();
+        let dest = base.join("b.tar.gz");
+
+        let r = pack(&root, &dest, &[]).unwrap();
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(r.bytes, bytes.len() as u64);
+        assert_eq!(r.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+
+        let mut names: Vec<String> = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]))
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["server.properties", "world/level.dat"]);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn links_are_not_followed_into_the_archive() {
+        let base = std::env::temp_dir().join(format!("noded-backup-{}", uuid::Uuid::new_v4()));
+        let root = base.join("server");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(base.join("noded.toml"), b"token=secret").unwrap();
+        std::os::unix::fs::symlink(base.join("noded.toml"), root.join("cfg.toml")).unwrap();
+        let dest = base.join("b.tar.gz");
+
+        pack(&root, &dest, &[]).unwrap();
+        let bytes = std::fs::read(&dest).unwrap();
+        let count = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]))
+            .entries()
+            .unwrap()
+            .count();
+        assert_eq!(count, 0);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

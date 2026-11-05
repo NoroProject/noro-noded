@@ -26,6 +26,16 @@ const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Как часто нода сама отчитывается о состоянии серверов.
 const STATE_POLL: Duration = Duration::from_secs(20);
+/// Сколько ждать рукопожатия и отправки одного кадра.
+///
+/// Без потолка зависшее рукопожатие (TCP принят, TLS молчит) держало ноду
+/// неподключённой навсегда, а отправка в полуоткрытое соединение висела, пока
+/// ядро не сдастся через четверть часа: петля стояла на ней и даже не
+/// проверяла, что мастер давно молчит.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Сколько может занять опрос состояний: зависший докер не должен держать
+/// петлю, которая ещё и читает кадры мастера.
+const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(daemon: Daemon, mut events: mpsc::Receiver<NodeEvent>) -> ! {
     let mut backoff = BACKOFF_START;
@@ -55,8 +65,9 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
         format!("Bearer {}", daemon.cfg.token).parse()?,
     );
 
-    let (stream, _) = tokio_tungstenite::connect_async(request)
+    let (stream, _) = tokio::time::timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(request))
         .await
+        .context("мастер не ответил на подключение")?
         .context("не подключиться к мастеру")?;
     tracing::info!(url = %daemon.cfg.ws_url(), "подключён к мастеру");
     let (mut tx, mut rx) = stream.split();
@@ -65,8 +76,7 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
     // своей таблицей: контейнер, снятый руками, и сервер, заведённый пока нода
     // была в офлайне, обнаруживаются только здесь.
     let hello = hello(daemon).await?;
-    tx.send(Message::Text(serde_json::to_string(&hello)?))
-        .await?;
+    push(&mut tx, Message::Text(serde_json::to_string(&hello)?)).await?;
     daemon.health.connected();
 
     let mut poll = tokio::time::interval(STATE_POLL);
@@ -88,7 +98,7 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
                         handle_frame(daemon, &replies_tx, &text);
                     }
                     Message::Ping(payload) => {
-                        tx.send(Message::Pong(payload)).await?;
+                        push(&mut tx, Message::Pong(payload)).await?;
                         last_seen = tokio::time::Instant::now();
                         daemon.health.touch();
                     }
@@ -98,12 +108,12 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
             }
 
             Some(frame) = replies.recv() => {
-                tx.send(Message::Text(frame)).await?;
+                push(&mut tx, Message::Text(frame)).await?;
             }
 
             Some(event) = events.recv() => {
                 let frame = FromNode::Event { event };
-                tx.send(Message::Text(serde_json::to_string(&frame)?)).await?;
+                push(&mut tx, Message::Text(serde_json::to_string(&frame)?)).await?;
             }
 
             _ = poll.tick() => {
@@ -112,13 +122,34 @@ async fn connect_once(daemon: &Daemon, events: &mut mpsc::Receiver<NodeEvent>) -
                 if last_seen.elapsed() > OFFLINE_AFTER {
                     bail!("мастер молчит дольше {OFFLINE_AFTER:?}");
                 }
-                for event in dispatch::poll_states(&daemon.engine, &daemon.registry).await {
+                let polled = tokio::time::timeout(
+                    POLL_TIMEOUT,
+                    dispatch::poll_states(&daemon.engine, &daemon.registry),
+                )
+                .await;
+                let Ok(states) = polled else {
+                    tracing::warn!("докер не ответил о состояниях вовремя");
+                    continue;
+                };
+                for event in states {
                     let frame = FromNode::Event { event };
-                    tx.send(Message::Text(serde_json::to_string(&frame)?)).await?;
+                    push(&mut tx, Message::Text(serde_json::to_string(&frame)?)).await?;
                 }
             }
         }
     }
+}
+
+/// Отправить кадр, не дольше `IO_TIMEOUT`.
+async fn push<S>(tx: &mut S, message: Message) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(IO_TIMEOUT, tx.send(message))
+        .await
+        .context("мастер не принимает кадры")??;
+    Ok(())
 }
 
 /// Разобрать кадр мастера. Ответ уходит каналом, а не в сокет: писать в него

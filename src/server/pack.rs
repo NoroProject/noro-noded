@@ -172,9 +172,7 @@ fn remove_stale(root: &Path, rel: &str) {
     let Ok(root) = root.canonicalize() else {
         return;
     };
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
-        || crate::fs::nofollow::remove(&path).is_err()
-    {
+    if crate::fs::nofollow::remove_file(&path).is_err() {
         return;
     }
     let mut dir = path.parent();

@@ -339,10 +339,7 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         self.require_delete()?;
         let path = self.resolve_entry(&filename)?;
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-            return Err(StatusCode::Failure);
-        }
-        blocking(|| crate::fs::nofollow::remove(&path).map_err(|_| StatusCode::Failure))?;
+        blocking(|| crate::fs::nofollow::remove_file(&path).map_err(|_| StatusCode::Failure))?;
         self.report(SftpActionKind::Delete, &filename);
         Ok(Self::ok(id))
     }

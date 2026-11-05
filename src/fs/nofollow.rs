@@ -224,6 +224,15 @@ pub fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Удалить файл или ссылку, но не каталог.
+///
+/// Для уборки, которая нашла файл обходом и удаляет его позже: за это время
+/// на его месте мог появиться каталог, и сносить его целиком она не просила.
+pub fn remove_file(path: &Path) -> std::io::Result<()> {
+    let (dir, name) = split(path)?;
+    std::fs::remove_file(dir.entry(name))
+}
+
 /// Переименовать запись, не идя по ссылкам ни в одном из двух каталогов.
 pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
     let (from_dir, from_name) = split(from)?;

@@ -104,7 +104,10 @@ fn prune(root: &Path, policy: &SyncPolicy, wanted: &HashSet<String>, report: &mu
         }
 
         if policy.prune {
-            match std::fs::remove_file(entry.path()) {
+            // Через сверенный каталог: синк идёт и по живому серверу, и
+            // каталог над найденным файлом успевали подменить ссылкой на
+            // каталог хоста с файлом того же имени.
+            match crate::fs::nofollow::remove_file(entry.path()) {
                 Ok(()) => report.deleted += 1,
                 Err(e) => {
                     tracing::warn!(path = %rel, error = %e, "лишний файл не удалён");
